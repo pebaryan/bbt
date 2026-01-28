@@ -325,6 +325,8 @@ def main():
                     help="Fixed sequence length for all steps (disables curriculum).")
     ap.add_argument("--seq_len_cap", type=int, default=None,
                     help="Upper bound applied to curriculum sequence length.")
+    ap.add_argument("--resume", type=str, default=None,
+                    help="Path to checkpoint to resume (loads model/opt/scaler/args.step).")
 
     args = ap.parse_args()
 
@@ -381,6 +383,20 @@ def main():
 
     scaler = torch.amp.GradScaler()
 
+    start_step = 0
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device)
+        state = ckpt["model"]
+        if is_ddp:
+            model.module.load_state_dict(state)
+        else:
+            model.load_state_dict(state)
+        opt.load_state_dict(ckpt["opt"])
+        scaler.load_state_dict(ckpt["scaler"])
+        start_step = int(ckpt.get("step", 0)) + 1
+        if rank == 0:
+            print(f"Resumed from {args.resume} at step {start_step}")
+
     # Data
     # ds = ByteStreamDataset(args.data, seq_len=2048, rank=rank, world_size=world_size)
     ds = ByteShardDataset(
@@ -407,7 +423,7 @@ def main():
     t0 = time.time()
     it = iter(dl)
 
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
         seq_len = seq_len_for_step(step)
         ds.set_seq_len(seq_len)
 
