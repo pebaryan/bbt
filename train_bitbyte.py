@@ -327,6 +327,8 @@ def main():
                     help="Upper bound applied to curriculum sequence length.")
     ap.add_argument("--resume", type=str, default=None,
                     help="Path to checkpoint to resume (loads model/opt/scaler/args.step).")
+    ap.add_argument("--no_opt_state", action="store_true",
+                    help="When resuming, load model weights only (fresh optimizer/scaler).")
 
     args = ap.parse_args()
 
@@ -390,9 +392,17 @@ def main():
             model.module.load_state_dict(state)
         else:
             model.load_state_dict(state)
-        opt.load_state_dict(ckpt["opt"])
-        scaler.load_state_dict(ckpt["scaler"])
-        start_step = int(ckpt.get("step", 0)) + 1
+
+        if not args.no_opt_state:
+            opt.load_state_dict(ckpt["opt"])
+            scaler.load_state_dict(ckpt["scaler"])
+            start_step = int(ckpt.get("step", 0)) + 1
+        else:
+            # Fresh optimizer/scaler; keep step for logging/decay
+            start_step = int(ckpt.get("step", 0)) + 1
+            if rank == 0:
+                print("Skipping optimizer/scaler state (fresh opt).")
+
         if rank == 0:
             print(f"Resumed from {args.resume} at step {start_step}")
 
