@@ -367,9 +367,8 @@ def main():
         model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False)
 
 
-    # Optimizer (bnb 8-bit if available)
+    # Optimizer (bnb 8-bit if available; falls back to torch)
     try:
-        raise
         import bitsandbytes as bnb
         opt = bnb.optim.AdamW8bit(model.parameters(), lr=args.lr, betas=(
             0.9, 0.95), weight_decay=args.wd)
