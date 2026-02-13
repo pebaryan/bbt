@@ -57,6 +57,12 @@ class Trainer:
         
         self.device = torch.device("cuda", local_rank)
         self.start_step = 0
+        self.model_family = getattr(args, "model_family", "bitbyte")
+
+        if self.rank == 0:
+            out_parent = os.path.dirname(self.args.out)
+            if out_parent:
+                os.makedirs(out_parent, exist_ok=True)
         
     def resume(self, path: str, load_opt_state: bool = True):
         """Resume from checkpoint.
@@ -66,6 +72,24 @@ class Trainer:
             load_opt_state: Whether to load optimizer state
         """
         ckpt = torch.load(path, map_location=self.device)
+        ckpt_variant = ckpt.get("variant")
+        if ckpt_variant is not None and ckpt_variant != "ar":
+            raise ValueError(
+                f"Checkpoint variant mismatch: expected 'ar', got {ckpt_variant!r}"
+            )
+        ckpt_family = ckpt.get("model_family")
+        if ckpt_family is not None and ckpt_family != self.model_family:
+            raise ValueError(
+                f"Checkpoint model family mismatch: expected {self.model_family!r}, got {ckpt_family!r}"
+            )
+        if ckpt_family is None and self.model_family != "bitbyte":
+            raise ValueError(
+                "Checkpoint missing model_family metadata; refusing non-bitbyte resume for safety."
+            )
+        ckpt_args = ckpt.get("args", {})
+        if isinstance(ckpt_args, dict) and "diffusion_steps" in ckpt_args:
+            raise ValueError("Diffusion checkpoint cannot be resumed with AR trainer.")
+
         state = ckpt["model"]
         
         if self.is_ddp:
@@ -162,6 +186,8 @@ class Trainer:
                 # Save non-DDP state
                 ckpt = {
                     "step": step,
+                    "variant": "ar",
+                    "model_family": self.model_family,
                     "model": (self.model.module.state_dict() if self.is_ddp else self.model.state_dict()),
                     "opt": self.optimizer.state_dict(),
                     "scaler": self.scaler.state_dict(),

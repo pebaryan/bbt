@@ -54,9 +54,9 @@ class MambaSSM(nn.Module):
         # Selective delta projection
         self.delta_proj = BitLinear(self.d_inner, self.d_state, bias=True, act_quant=act_quant)
         
-        # B and C matrices (state to output)
-        self.B_proj = BitLinear(self.d_state, self.d_inner, bias=False, act_quant=act_quant)
-        self.C_proj = BitLinear(self.d_state, self.d_inner, bias=False, act_quant=act_quant)
+        # Input-dependent B/C projections into state space
+        self.B_proj = BitLinear(self.d_inner, self.d_state, bias=False, act_quant=act_quant)
+        self.C_proj = BitLinear(self.d_inner, self.d_state, bias=False, act_quant=act_quant)
         
         # Output projection
         self.out_proj = BitLinear(self.d_inner, d_model, bias=False, act_quant=act_quant)
@@ -96,28 +96,24 @@ class MambaSSM(nn.Module):
         # Compute delta (selective)
         delta = self.delta_proj(x_input)  # [B, L, d_state]
         
-        # Discretize SSM with selective delta
-        # A_d = exp(delta * A), B_d = delta * B, C_d = C
-        A_d = torch.exp(delta.unsqueeze(-1) * self.log_A)  # [B, L, d_state]
-        delta_B = delta.unsqueeze(-1)  # [B, L, d_state, 1]
-        
-        # Compute B matrix (simplified - normally depends on x_input)
+        # Discretize A with selective per-token delta: A_d in (0,1)
+        A_d = torch.exp(delta * self.log_A.view(1, 1, -1))  # [B, L, d_state]
+
+        # Input-dependent B/C in state space
         B_matrix = self.B_proj(x_input.view(B * L, self.d_inner)).view(B, L, self.d_state)
-        B_d = delta_B * B_matrix.unsqueeze(-1)  # [B, L, d_state, 1]
-        
-        # Process state
-        x_ssm = torch.zeros(B, L + 1, self.d_state, device=x.device)
-        for t in range(L):
-            x_ssm[:, t + 1] = A_d[:, t] * x_ssm[:, t] + B_d[:, t].squeeze(-1)
-        
-        # Compute output
         C_matrix = self.C_proj(x_input.view(B * L, self.d_inner)).view(B, L, self.d_state)
-        y = torch.sum(C_matrix * x_ssm[:, 1:], dim=-1)  # [B, L]
-        
-        # Add direct connection
-        y = y + self.D * x_input.sum(dim=-1)
-        
+
+        # Single state vector per token stream (lightweight approximation).
+        h = torch.zeros(B, self.d_state, device=x.device, dtype=x.dtype)
+        state_signal = torch.zeros(B, L, 1, device=x.device, dtype=x.dtype)
+        for t in range(L):
+            h = A_d[:, t] * h + delta[:, t] * B_matrix[:, t]
+            state_signal[:, t, 0] = torch.sum(C_matrix[:, t] * h, dim=-1)
+
+        # Modulate token features with SSM signal and keep direct pathway.
+        y_inner = x_input * (torch.sigmoid(state_signal) + self.D.view(1, 1, -1))
+
         # Output projection
-        y = self.out_proj(y.unsqueeze(-1)).squeeze(-1)  # [B, L, d_model]
+        y = self.out_proj(y_inner)  # [B, L, d_model]
         
         return y

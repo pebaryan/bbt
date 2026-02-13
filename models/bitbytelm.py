@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 
 from .block import Block
+from .rmsnorm import RMSNorm
 
 
 class BitByteLM(nn.Module):

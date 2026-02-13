@@ -1,0 +1,10 @@
+-r requirements.txt
+
+# Testing
+pytest>=8.0
+
+# Linting/format checks
+ruff>=0.6
+
+# Type checking
+mypy>=1.10

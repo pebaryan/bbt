@@ -1,0 +1,10 @@
+# Install a CUDA-matching PyTorch build for training GPUs:
+# https://pytorch.org/get-started/locally/
+torch>=2.3
+
+# Utilities/scripts
+tqdm>=4.66
+matplotlib>=3.8
+
+# Optional: 8-bit optimizer path in utils/optim.py
+# bitsandbytes>=0.43

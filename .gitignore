@@ -1,1 +1,17 @@
-__pycache__
+__pycache__/
+*.py[cod]
+
+# Local environments
+.venv/
+.env
+
+# Notebook cache/artifacts
+.ipynb_checkpoints/
+*.ipynb
+
+# Local artifacts (datasets, checkpoints, logs, plots)
+artifacts/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
