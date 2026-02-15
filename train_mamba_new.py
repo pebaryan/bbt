@@ -29,10 +29,13 @@ def create_model(args: argparse.Namespace, device: torch.device) -> MambaMLM:
     return model
 
 
-def create_dataset(args: argparse.Namespace, rank: int, world_size: int) -> ByteShardDataset:
+def create_dataset(
+    args: argparse.Namespace, rank: int, world_size: int
+) -> ByteShardDataset:
+    seq_len = args.seq_len if args.seq_len is not None else 2048
     ds = ByteShardDataset(
         shard_glob=os.path.join(args.data, "shard_*.bin"),
-        seq_len=2048,
+        seq_len=seq_len,
         seed=1234,
         rank=rank,
         world_size=world_size,
@@ -49,8 +52,15 @@ def _same_path(a: str, b: str) -> bool:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, required=True, help="Path to a directory of shard_*.bin files")
-    ap.add_argument("--out", type=str, default="artifacts/checkpoints/mamba/ckpt_mamba.pt")
+    ap.add_argument(
+        "--data",
+        type=str,
+        required=True,
+        help="Path to a directory of shard_*.bin files",
+    )
+    ap.add_argument(
+        "--out", type=str, default="artifacts/checkpoints/mamba/ckpt_mamba.pt"
+    )
     ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--save_every", type=int, default=2000)
@@ -70,12 +80,27 @@ def main() -> None:
     ap.add_argument("--wd", type=float, default=0.1)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
-    ap.add_argument("--batch_size", type=int, default=1, help="microbatch sequences per GPU")
+    ap.add_argument(
+        "--batch_size", type=int, default=1, help="microbatch sequences per GPU"
+    )
     ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--seq_len", type=int, default=None, help="Fixed sequence length for all steps")
-    ap.add_argument("--seq_len_cap", type=int, default=None, help="Upper bound applied to curriculum sequence length")
-    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
-    ap.add_argument("--no_opt_state", action="store_true", help="When resuming, load model weights only")
+    ap.add_argument(
+        "--seq_len", type=int, default=None, help="Fixed sequence length for all steps"
+    )
+    ap.add_argument(
+        "--seq_len_cap",
+        type=int,
+        default=None,
+        help="Upper bound applied to curriculum sequence length",
+    )
+    ap.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume"
+    )
+    ap.add_argument(
+        "--no_opt_state",
+        action="store_true",
+        help="When resuming, load model weights only",
+    )
     ap.add_argument(
         "--allow_overwrite",
         action="store_true",
@@ -103,10 +128,15 @@ def main() -> None:
     model = create_model(args, device)
     if is_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=False
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,
         )
 
-    opt, use_bnb = create_optimizer(model, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.wd)
+    opt, use_bnb = create_optimizer(
+        model, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.wd
+    )
     if rank == 0:
         print(f"Using {'bitsandbytes AdamW8bit' if use_bnb else 'torch AdamW'}")
 
@@ -126,7 +156,9 @@ def main() -> None:
         trainer.resume(args.resume, load_opt_state=not args.no_opt_state)
 
     ds = create_dataset(args, rank, world_size)
-    dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
+    dl = torch.utils.data.DataLoader(
+        ds, batch_size=args.batch_size, num_workers=0, pin_memory=True
+    )
     trainer.train(dl)
 
     if is_ddp:
