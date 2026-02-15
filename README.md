@@ -166,6 +166,34 @@ Smoke test (CPU-safe, synthetic data, 10 steps):
 python train_bitbyte_diffusion.py --smoke_test
 ```
 
+## Validation Results
+
+All checkpoints have been validated on `artifacts/datasets/misc_shards/shard_00003.bin`.
+
+### BitByteLM (Autoregressive)
+| Checkpoint | Validation BPB | Training Steps | Model Size |
+|-----------|----------------|----------------|------------|
+| `ckpt.pt` | **0.7005** | 25,400 | 24L/1536D |
+| `ckpt-9200-1024.pt` | 0.9094 | 9,200 | 24L/1536D |
+
+### Diffusion Models (Denoising)
+| Checkpoint | Masked BPB | Training Steps | Model Size |
+|-----------|------------|----------------|------------|
+| `ckpt_diffusion_final.pt` | **0.0273** | 500 | 2L/128D |
+| `ckpt_diffusion_1k.pt` | 0.0278 | 1,000 | (varies) |
+| `ckpt_diffusion_5k_final.pt` | 0.0335 | 5,000 | (varies) |
+| `ckpt_diffusion.pt` | 0.0346 | 300 | 6L/320D |
+
+### Mamba Models
+| Checkpoint | Validation BPB | Training Steps | Model Size |
+|-----------|----------------|----------------|------------|
+| `ckpt_mamba.pt` | **4.0401** | 100 | 6L/384D |
+| `ckpt_mamba_500.pt` | 4.4795 | 500 | 6L/384D |
+
+**Notes:**
+- Diffusion BPB measures denoising loss on masked tokens only (not directly comparable to AR)
+- Mamba models were trained for very few steps; longer training needed for competitive performance
+
 ## Demo Generation (AR Checkpoint)
 ```bash
 python demo_generate.py \
