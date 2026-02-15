@@ -194,7 +194,9 @@ All checkpoints have been validated on `artifacts/datasets/misc_shards/shard_000
 - Diffusion BPB measures denoising loss on masked tokens only (not directly comparable to AR)
 - Mamba models were trained for very few steps; longer training needed for competitive performance
 
-## Demo Generation (AR Checkpoint)
+## Demo Generation
+
+### BitByteLM (Autoregressive)
 ```bash
 python demo_generate.py \
   --ckpt artifacts/checkpoints/ckpt.pt \
@@ -208,3 +210,31 @@ Notes:
 - Use `--device cpu` if CUDA is unavailable.
 - Add `--metrics` to print latency/throughput/memory stats.
 - Add `--metrics_json artifacts/reports/generation_metrics.json` to save stats.
+
+### Mamba
+```bash
+python demo_mamba.py \
+  --ckpt artifacts/checkpoints/mamba/ckpt_mamba.pt \
+  --prompt "Once upon a time" \
+  --max_new_tokens 300 \
+  --temperature 0.9 \
+  --top_k 50
+```
+Notes:
+- Same interface as `demo_generate.py` for autoregressive generation.
+- Mamba models use state-space layers instead of attention.
+
+### Diffusion (Infilling)
+```bash
+python demo_diffusion.py \
+  --ckpt artifacts/checkpoints/diffusion/ckpt_diffusion.pt \
+  --prompt "Once upon a time there was a " \
+  --max_length 50 \
+  --temperature 1.0
+```
+Notes:
+- Diffusion models perform **infilling** rather than left-to-right generation.
+- The model predicts masked positions in the input sequence.
+- If no mask token (byte 256) is present, random positions are masked.
+- Use `--temperature 0` for greedy decoding of masked positions.
+- Add `--metrics` to print performance stats.
