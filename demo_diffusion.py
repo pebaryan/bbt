@@ -66,12 +66,15 @@ def infill(
 
     If no mask token (256) is present in the prompt, randomly masks some positions.
     """
-    # Ensure we have at least max_length tokens
-    if len(prompt) < max_length:
-        prompt = prompt + bytes([mask_token_id] * (max_length - len(prompt)))
-    prompt = prompt[:max_length]
+    # Convert prompt to list of ints (mask_token_id can be > 255)
+    prompt_list = list(prompt)
 
-    x = torch.tensor([list(prompt)], dtype=torch.long, device=device)
+    # Ensure we have at least max_length tokens
+    if len(prompt_list) < max_length:
+        prompt_list = prompt_list + [mask_token_id] * (max_length - len(prompt_list))
+    prompt_list = prompt_list[:max_length]
+
+    x = torch.tensor([prompt_list], dtype=torch.long, device=device)
 
     # Check if there are any mask tokens
     mask_positions = x == mask_token_id
@@ -206,7 +209,9 @@ def main() -> None:
     mask_str = "".join(["^" if m else " " for m in mask_array[: len(out_bytes)]])
     print(mask_str)
     print("\nInfilled result:")
-    result_str = out_bytes.decode("utf-8", errors="replace")
+    # Filter out non-printable bytes and mask token (256) for display
+    display_bytes = bytes([b for b in out_bytes if b < 128 and b >= 32])
+    result_str = display_bytes.decode("utf-8", errors="replace")
     print(result_str)
 
     num_params = sum(p.numel() for p in model.parameters())
