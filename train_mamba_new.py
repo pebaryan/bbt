@@ -25,6 +25,7 @@ def create_model(args: argparse.Namespace, device: torch.device) -> MambaMLM:
         d_conv=args.d_conv,
         expand=args.expand,
         act_quant=not args.no_act_quant,
+        use_checkpoint=not args.no_checkpoint,
     ).to(device)
     return model
 
@@ -74,6 +75,9 @@ def main() -> None:
 
     ap.add_argument("--ddp", action="store_true", help="Enable DDP (requires torchrun)")
     ap.add_argument("--no_act_quant", action="store_true")
+    ap.add_argument(
+        "--no_checkpoint", action="store_true", help="Disable gradient checkpointing"
+    )
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup_frac", type=float, default=0.03)

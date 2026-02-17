@@ -10,13 +10,13 @@ from .mamba_ssm import MambaSSM
 
 class MambaBlock(nn.Module):
     """Transformer block using Mamba SSM instead of attention.
-    
+
     Implements a Mamba-based transformer block with:
     - RMSNorm
     - Mamba SSM (replaces attention)
     - MLP with SwiGLU
     """
-    
+
     def __init__(
         self,
         d_model: int,
@@ -25,9 +25,10 @@ class MambaBlock(nn.Module):
         d_conv: int = 4,
         expand: int = 2,
         act_quant: bool = True,
+        use_checkpoint: bool = True,
     ):
         """Initialize Mamba block.
-        
+
         Args:
             d_model: Model dimension
             d_ff: Feed-forward dimension
@@ -35,28 +36,34 @@ class MambaBlock(nn.Module):
             d_conv: Convolution kernel size for SSM
             expand: Expansion factor for SSM inner dimension
             act_quant: Whether to quantize activations
+            use_checkpoint: Whether to use gradient checkpointing for SSM
         """
         super().__init__()
         self.n1 = RMSNorm(d_model)
         self.ssm = MambaSSM(
-            d_model, d_state=d_state, d_conv=d_conv, expand=expand, act_quant=act_quant
+            d_model,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand,
+            act_quant=act_quant,
+            use_checkpoint=use_checkpoint,
         )
         self.n2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, d_ff, act_quant=act_quant)
-    
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass.
-        
+
         Args:
             x: Input [B, L, d_model]
-            
+
         Returns:
             Output [B, L, d_model]
         """
         # Residual SSM
         x = x + self.ssm(self.n1(x))
-        
+
         # Residual MLP
         x = x + self.mlp(self.n2(x))
-        
+
         return x
