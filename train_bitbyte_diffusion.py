@@ -35,7 +35,9 @@ def create_model(args: argparse.Namespace, device: torch.device) -> BitByteDiffu
     return model
 
 
-def create_dataset(args: argparse.Namespace, rank: int, world_size: int) -> ByteShardDataset:
+def create_dataset(
+    args: argparse.Namespace, rank: int, world_size: int
+) -> ByteShardDataset:
     initial_seq_len = args.seq_len if args.seq_len is not None else 2048
     return ByteShardDataset(
         shard_glob=os.path.join(args.data, "shard_*.bin"),
@@ -72,7 +74,11 @@ def maybe_resume(
             f"Checkpoint variant mismatch: expected 'diffusion', got {ckpt_variant!r}"
         )
     ckpt_args = ckpt.get("args", {})
-    if isinstance(ckpt_args, dict) and "diffusion_steps" not in ckpt_args and ckpt_variant is None:
+    if (
+        isinstance(ckpt_args, dict)
+        and "diffusion_steps" not in ckpt_args
+        and ckpt_variant is None
+    ):
         raise ValueError("Checkpoint does not look like a diffusion checkpoint.")
 
     state = ckpt["model"]
@@ -95,8 +101,15 @@ def maybe_resume(
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data", type=str, default=None, help="Path to a directory of shard_*.bin files")
-    ap.add_argument("--out", type=str, default="artifacts/checkpoints/diffusion/ckpt_diffusion.pt")
+    ap.add_argument(
+        "--data",
+        type=str,
+        default=None,
+        help="Path to a directory of shard_*.bin files",
+    )
+    ap.add_argument(
+        "--out", type=str, default="artifacts/checkpoints/diffusion/ckpt_diffusion.pt"
+    )
     ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--save_every", type=int, default=2000)
@@ -118,19 +131,40 @@ def main() -> None:
     ap.add_argument("--wd", type=float, default=0.1)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
-    ap.add_argument("--batch_size", type=int, default=1, help="microbatch sequences per GPU")
+    ap.add_argument(
+        "--batch_size", type=int, default=1, help="microbatch sequences per GPU"
+    )
     ap.add_argument("--grad_accum", type=int, default=8)
-    ap.add_argument("--seq_len", type=int, default=None, help="Fixed sequence length for all steps")
-    ap.add_argument("--seq_len_cap", type=int, default=None, help="Upper bound for curriculum sequence length")
-    ap.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume")
+    ap.add_argument(
+        "--seq_len", type=int, default=None, help="Fixed sequence length for all steps"
+    )
+    ap.add_argument(
+        "--seq_len_cap",
+        type=int,
+        default=None,
+        help="Upper bound for curriculum sequence length",
+    )
+    ap.add_argument(
+        "--resume", type=str, default=None, help="Path to checkpoint to resume"
+    )
     ap.add_argument(
         "--no_opt_state",
         action="store_true",
         help="When resuming, load model weights only (fresh optimizer/scaler)",
     )
 
-    ap.add_argument("--diffusion_steps", type=int, default=64, help="Number of diffusion denoising steps")
-    ap.add_argument("--mask_token_id", type=int, default=256, help="Special mask token id (must be >= 256)")
+    ap.add_argument(
+        "--diffusion_steps",
+        type=int,
+        default=64,
+        help="Number of diffusion denoising steps",
+    )
+    ap.add_argument(
+        "--mask_token_id",
+        type=int,
+        default=256,
+        help="Special mask token id (must be >= 256)",
+    )
     ap.add_argument(
         "--min_mask_prob",
         type=float,
@@ -240,7 +274,9 @@ def main() -> None:
     it = None
     if not args.smoke_test:
         ds = create_dataset(args, rank, world_size)
-        dl = torch.utils.data.DataLoader(ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
+        dl = torch.utils.data.DataLoader(
+            ds, batch_size=args.batch_size, num_workers=0, pin_memory=True
+        )
         it = iter(dl)
 
     warmup_steps = int(args.steps * args.warmup_frac)
@@ -254,10 +290,14 @@ def main() -> None:
         )
 
     for step in range(start_step, args.steps):
-        seq_len = args.seq_len if args.seq_len is not None else seq_len_for_step(
-            step,
-            args.steps,
-            cap=args.seq_len_cap,
+        seq_len = (
+            args.seq_len
+            if args.seq_len is not None
+            else seq_len_for_step(
+                step,
+                args.steps,
+                cap=args.seq_len_cap,
+            )
         )
         if dl is not None:
             dl.dataset.set_seq_len(seq_len)
@@ -270,10 +310,13 @@ def main() -> None:
         total_loss = 0.0
         total_mask_frac = 0.0
         valid_micros = 0
+        grad_norm = 0.0
 
         for micro in range(args.grad_accum):
             if args.smoke_test:
-                x0 = torch.randint(0, 256, (args.batch_size, seq_len), device=device, dtype=torch.long)
+                x0 = torch.randint(
+                    0, 256, (args.batch_size, seq_len), device=device, dtype=torch.long
+                )
             else:
                 x0, _ = next(it)
                 x0 = x0.to(device, non_blocking=True)
@@ -299,7 +342,9 @@ def main() -> None:
                 loss = raw_loss / args.grad_accum
 
             if not torch.isfinite(loss):
-                print(f"[WARN] non-finite loss at step {step}, skipping microbatch {micro}")
+                print(
+                    f"[WARN] non-finite loss at step {step}, skipping microbatch {micro}"
+                )
                 continue
 
             scaler.scale(loss).backward()
@@ -313,7 +358,22 @@ def main() -> None:
             continue
 
         scaler.unscale_(opt)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        # Compute gradient norm for monitoring
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
+
+        # Check for exploding gradients
+        if not torch.isfinite(grad_norm):
+            print(f"[WARN] non-finite grad norm {grad_norm} at step {step}, skipping")
+            opt.zero_grad(set_to_none=True)
+            scaler.update()
+            continue
+
+        if grad_norm > args.grad_clip * 10:
+            print(
+                f"[WARN] large grad norm {grad_norm:.2f} at step {step}, clipped to {args.grad_clip}"
+            )
+
         scaler.step(opt)
         scaler.update()
 
@@ -334,7 +394,7 @@ def main() -> None:
                 print(
                     f"step {step:6d}  seq {seq_len:4d}  "
                     f"loss {loss_avg:.4f}  masked_bpb {bpb_masked:.4f}  "
-                    f"mask {mask_avg * 100.0:.1f}%  {dt:.1f}s"
+                    f"mask {mask_avg * 100.0:.1f}%  gn {grad_norm:.2f}  {dt:.1f}s"
                 )
             t0 = time.time()
 

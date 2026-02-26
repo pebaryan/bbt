@@ -18,6 +18,7 @@ from training.lr_scheduler import lr_for_step, seq_len_for_step
 from training.loss import bits_per_byte
 
 import os
+import tempfile
 
 
 class Trainer:
@@ -71,7 +72,16 @@ class Trainer:
             path: Path to checkpoint
             load_opt_state: Whether to load optimizer state
         """
-        ckpt = torch.load(path, map_location=self.device)
+        # Training checkpoints include optimizer/scaler/args objects, so they
+        # must be loaded with weights_only=False on PyTorch 2.6+.
+        try:
+            ckpt = torch.load(path, map_location=self.device, weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to load checkpoint {path!r}. "
+                "The checkpoint may be corrupt or incomplete. "
+                "Try resuming from an earlier known-good checkpoint."
+            ) from exc
         ckpt_variant = ckpt.get("variant")
         if ckpt_variant is not None and ckpt_variant != "ar":
             raise ValueError(
@@ -98,6 +108,11 @@ class Trainer:
             self.model.load_state_dict(state)
 
         if load_opt_state:
+            if "opt" not in ckpt or "scaler" not in ckpt:
+                raise KeyError(
+                    "Checkpoint missing optimizer/scaler state. "
+                    "Use --no_opt_state to resume weights only."
+                )
             self.optimizer.load_state_dict(ckpt["opt"])
             self.scaler.load_state_dict(ckpt["scaler"])
             self.start_step = int(ckpt.get("step", 0)) + 1
@@ -116,7 +131,12 @@ class Trainer:
             dataloader: Data loader for training data
         """
         args = self.args
-        warmup_steps = int(args.steps * args.warmup_frac)
+        warmup_steps = (
+            int(args.warmup_steps)
+            if getattr(args, "warmup_steps", None) is not None
+            else int(args.steps * args.warmup_frac)
+        )
+        warmup_steps = max(0, min(warmup_steps, max(1, args.steps)))
 
         self.model.train()
         t0 = time.time()
@@ -130,8 +150,24 @@ class Trainer:
             )
             dataloader.dataset.set_seq_len(seq_len)
 
+            if getattr(args, "lr_schedule", "cosine") == "cosine":
+                step_lr = lr_for_step(
+                    step,
+                    warmup_steps,
+                    args.steps,
+                    args.lr,
+                    min_lr_factor=getattr(args, "lr_min_factor", 0.1),
+                )
+            elif args.lr_schedule == "constant":
+                if step < warmup_steps:
+                    step_lr = args.lr * (step + 1) / max(1, warmup_steps)
+                else:
+                    step_lr = args.lr
+            else:
+                raise ValueError(f"Unsupported lr_schedule: {args.lr_schedule}")
+
             for g in self.optimizer.param_groups:
-                g["lr"] = lr_for_step(step, warmup_steps, args.steps, args.lr)
+                g["lr"] = step_lr
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -179,7 +215,8 @@ class Trainer:
                     dt = time.time() - t0
                     bpb = loss_avg / math.log(2.0)
                     print(
-                        f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  bpb {bpb:.4f}  {dt:.1f}s")
+                        f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  "
+                        f"bpb {bpb:.4f}  lr {step_lr:.2e}  {dt:.1f}s")
                 t0 = time.time()
 
             if self.rank == 0 and (step % args.save_every == 0) and step > 0:
@@ -193,5 +230,23 @@ class Trainer:
                     "scaler": self.scaler.state_dict(),
                     "args": vars(args),
                 }
-                torch.save(ckpt, args.out)
+                self._save_checkpoint_atomic(ckpt, args.out)
                 print(f"saved {args.out}")
+
+    def _save_checkpoint_atomic(self, ckpt: dict, out_path: str) -> None:
+        out_parent = os.path.dirname(out_path)
+        if out_parent:
+            os.makedirs(out_parent, exist_ok=True)
+
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=".tmp_ckpt_",
+            suffix=".pt",
+            dir=out_parent or ".",
+        )
+        os.close(fd)
+        try:
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, out_path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)

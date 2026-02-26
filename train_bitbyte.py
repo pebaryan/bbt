@@ -329,6 +329,8 @@ def main():
                     help="Path to checkpoint to resume (loads model/opt/scaler/args.step).")
     ap.add_argument("--no_opt_state", action="store_true",
                     help="When resuming, load model weights only (fresh optimizer/scaler).")
+    ap.add_argument("--log_byte_class_loss", action="store_true",
+                    help="Log separate loss for whitespace vs non-whitespace target bytes.")
 
     args = ap.parse_args()
 
@@ -442,7 +444,12 @@ def main():
         opt.zero_grad(set_to_none=True)
 
         did_backward = False
-        total_loss = 0.0
+        step_nll_sum = 0.0
+        step_tok_count = 0
+        ws_nll_sum = 0.0
+        ws_tok_count = 0
+        nonws_nll_sum = 0.0
+        nonws_tok_count = 0
 
         for micro in range(args.grad_accum):
             x, y = next(it)
@@ -451,8 +458,10 @@ def main():
 
             with torch.amp.autocast("cuda", dtype=torch.float16):
                 logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, 256), y.view(-1))
-                loss = loss / args.grad_accum
+                y_flat = y.view(-1)
+                ce_tok = F.cross_entropy(
+                    logits.view(-1, 256), y_flat, reduction="none")
+                loss = ce_tok.mean() / args.grad_accum
 
             if not torch.isfinite(loss):
                 print(f"[WARN] non-finite loss at step {step}, skipping microbatch {micro}")
@@ -460,7 +469,26 @@ def main():
 
             scaler.scale(loss).backward()
             did_backward = True
-            total_loss += float(loss.item())
+            with torch.no_grad():
+                step_nll_sum += float(ce_tok.sum().item())
+                step_tok_count += int(ce_tok.numel())
+                if args.log_byte_class_loss:
+                    is_ws = (
+                        (y_flat == 9) |
+                        (y_flat == 10) |
+                        (y_flat == 11) |
+                        (y_flat == 12) |
+                        (y_flat == 13) |
+                        (y_flat == 32)
+                    )
+                    ws_count = int(is_ws.sum().item())
+                    if ws_count > 0:
+                        ws_nll_sum += float(ce_tok[is_ws].sum().item())
+                        ws_tok_count += ws_count
+                    nonws_count = int((~is_ws).sum().item())
+                    if nonws_count > 0:
+                        nonws_nll_sum += float(ce_tok[~is_ws].sum().item())
+                        nonws_tok_count += nonws_count
 
         if not did_backward:
             # nothing to step; move on
@@ -476,17 +504,40 @@ def main():
 
         if step % args.log_every == 0:
             # all-reduce loss for reporting
-            loss_avg = total_loss
+            loss_sum = step_nll_sum
+            tok_count = step_tok_count
             if is_ddp:
-                loss_t = torch.tensor([total_loss], device=device)
-                dist.all_reduce(loss_t, op=dist.ReduceOp.SUM)
-                loss_avg = loss_t.item() / world_size
+                stats = torch.tensor(
+                    [loss_sum, float(tok_count), ws_nll_sum, float(ws_tok_count),
+                     nonws_nll_sum, float(nonws_tok_count)],
+                    device=device,
+                    dtype=torch.float64,
+                )
+                dist.all_reduce(stats, op=dist.ReduceOp.SUM)
+                loss_sum = float(stats[0].item())
+                tok_count = int(stats[1].item())
+                ws_nll_sum = float(stats[2].item())
+                ws_tok_count = int(stats[3].item())
+                nonws_nll_sum = float(stats[4].item())
+                nonws_tok_count = int(stats[5].item())
+
+            loss_avg = loss_sum / max(1, tok_count)
 
             if rank == 0:
                 dt = time.time() - t0
                 bpb = loss_avg / math.log(2.0)
-                print(
-                    f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  bpb {bpb:.4f}  {dt:.1f}s")
+                if args.log_byte_class_loss:
+                    ws_loss = ws_nll_sum / max(1, ws_tok_count)
+                    ws_bpb = ws_loss / math.log(2.0)
+                    nonws_loss = nonws_nll_sum / max(1, nonws_tok_count)
+                    nonws_bpb = nonws_loss / math.log(2.0)
+                    print(
+                        f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  bpb {bpb:.4f}  "
+                        f"ws_loss {ws_loss:.4f}  ws_bpb {ws_bpb:.4f}  "
+                        f"nonws_loss {nonws_loss:.4f}  nonws_bpb {nonws_bpb:.4f}  {dt:.1f}s")
+                else:
+                    print(
+                        f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  bpb {bpb:.4f}  {dt:.1f}s")
             t0 = time.time()
 
         if rank == 0 and (step % args.save_every == 0) and step > 0:

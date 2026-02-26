@@ -4,6 +4,7 @@ from .attention import CausalSelfAttention
 from .mlp import MLP, SwiGLU
 from .block import Block
 from .bitbytelm import BitByteLM
+from .bitbytelm_fast import FastBitByteLM
 from .bitbyte_diffusion import BitByteDiffusionLM
 
 # Mamba components
@@ -19,6 +20,7 @@ __all__ = [
     'SwiGLU',
     'Block',
     'BitByteLM',
+    'FastBitByteLM',
     'BitByteDiffusionLM',
     'MambaBlock',
     'MambaSSM',

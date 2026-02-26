@@ -72,6 +72,25 @@ def main():
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup_frac", type=float, default=0.03)
+    ap.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=None,
+        help="Explicit warmup steps (overrides --warmup_frac when set)",
+    )
+    ap.add_argument(
+        "--lr_schedule",
+        type=str,
+        default="cosine",
+        choices=["cosine", "constant"],
+        help="Learning rate schedule after warmup",
+    )
+    ap.add_argument(
+        "--lr_min_factor",
+        type=float,
+        default=0.1,
+        help="Min LR as fraction of base LR for cosine schedule",
+    )
     ap.add_argument("--wd", type=float, default=0.1)
     ap.add_argument("--grad_clip", type=float, default=1.0)
 
@@ -94,6 +113,13 @@ def main():
 
     args = ap.parse_args()
     args.model_family = "bitbyte"
+
+    if args.warmup_steps is not None and args.warmup_steps < 0:
+        raise ValueError("--warmup_steps must be >= 0")
+    if not (0.0 <= args.warmup_frac <= 1.0):
+        raise ValueError("--warmup_frac must be in [0, 1]")
+    if args.lr_min_factor < 0.0:
+        raise ValueError("--lr_min_factor must be >= 0")
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)
     device = torch.device("cuda", local_rank)
@@ -140,6 +166,11 @@ def main():
     )
     
     if args.resume:
+        if args.no_opt_state and rank == 0:
+            print(
+                "[WARN] --no_opt_state set: resuming model weights with fresh optimizer/scaler. "
+                "For stable continuation, omit --no_opt_state."
+            )
         trainer.resume(args.resume, load_opt_state=not args.no_opt_state)
 
     # Create dataset
