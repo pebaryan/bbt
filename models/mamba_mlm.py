@@ -27,6 +27,10 @@ class MambaMLM(nn.Module):
         expand: int = 2,
         act_quant: bool = True,
         use_checkpoint: bool = True,
+        time_step_min: float = 1e-3,
+        time_step_max: float = 1e-1,
+        dt_init: str = "log_uniform",
+        a_init: str = "uniform_0_16",
     ):
         """Initialize MambaMLM.
 
@@ -40,6 +44,10 @@ class MambaMLM(nn.Module):
             expand: Expansion factor for SSM inner dimension
             act_quant: Whether to quantize activations
             use_checkpoint: Whether to use gradient checkpointing for SSM
+            time_step_min: Minimum initial dt value for delta softplus bias
+            time_step_max: Maximum initial dt value for delta softplus bias
+            dt_init: Initialization for delta bias ("log_uniform" or "zeros")
+            a_init: Initialization for A_log ("uniform_0_16" or "log_arange")
         """
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
@@ -56,6 +64,10 @@ class MambaMLM(nn.Module):
                     expand=expand,
                     act_quant=act_quant,
                     use_checkpoint=use_checkpoint,
+                    time_step_min=time_step_min,
+                    time_step_max=time_step_max,
+                    dt_init=dt_init,
+                    a_init=a_init,
                 )
                 for _ in range(n_layer)
             ]

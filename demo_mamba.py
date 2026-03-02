@@ -33,6 +33,10 @@ def load_model(ckpt_path: str, device: torch.device) -> tuple[MambaMLM, dict]:
         d_conv=_ckpt_arg(cfg, "d_conv", 4),
         expand=_ckpt_arg(cfg, "expand", 2),
         act_quant=not _ckpt_arg(cfg, "no_act_quant", False),
+        time_step_min=_ckpt_arg(cfg, "time_step_min", 1e-3),
+        time_step_max=_ckpt_arg(cfg, "time_step_max", 1e-1),
+        dt_init=_ckpt_arg(cfg, "dt_init", "log_uniform"),
+        a_init=_ckpt_arg(cfg, "a_init", "uniform_0_16"),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

@@ -26,6 +26,10 @@ def create_model(args: argparse.Namespace, device: torch.device) -> MambaMLM:
         expand=args.expand,
         act_quant=not args.no_act_quant,
         use_checkpoint=not args.no_checkpoint,
+        time_step_min=args.time_step_min,
+        time_step_max=args.time_step_max,
+        dt_init=args.dt_init,
+        a_init=args.a_init,
     ).to(device)
     return model
 
@@ -37,7 +41,7 @@ def create_dataset(
     ds = ByteShardDataset(
         shard_glob=os.path.join(args.data, "shard_*.bin"),
         seq_len=seq_len,
-        seed=1234,
+        seed=args.seed,
         rank=rank,
         world_size=world_size,
     )
@@ -65,6 +69,7 @@ def main() -> None:
     ap.add_argument("--steps", type=int, default=200000)
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--save_every", type=int, default=2000)
+    ap.add_argument("--seed", type=int, default=1234)
 
     ap.add_argument("--n_layer", type=int, default=24)
     ap.add_argument("--d_model", type=int, default=1536)
@@ -72,6 +77,32 @@ def main() -> None:
     ap.add_argument("--d_state", type=int, default=16)
     ap.add_argument("--d_conv", type=int, default=4)
     ap.add_argument("--expand", type=int, default=2)
+    ap.add_argument(
+        "--time_step_min",
+        type=float,
+        default=1e-3,
+        help="Minimum initial dt value for Mamba delta bias initialization",
+    )
+    ap.add_argument(
+        "--time_step_max",
+        type=float,
+        default=1e-1,
+        help="Maximum initial dt value for Mamba delta bias initialization",
+    )
+    ap.add_argument(
+        "--dt_init",
+        type=str,
+        default="log_uniform",
+        choices=["log_uniform", "zeros"],
+        help="Initialization for Mamba delta bias",
+    )
+    ap.add_argument(
+        "--a_init",
+        type=str,
+        default="uniform_0_16",
+        choices=["uniform_0_16", "log_arange"],
+        help="Initialization for Mamba A_log parameter",
+    )
 
     ap.add_argument("--ddp", action="store_true", help="Enable DDP (requires torchrun)")
     ap.add_argument("--no_act_quant", action="store_true")
@@ -116,6 +147,9 @@ def main() -> None:
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)
     device = torch.device("cuda", local_rank)
+    torch.manual_seed(args.seed + rank)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed + rank)
 
     resume_same_out = args.resume is not None and _same_path(args.resume, args.out)
     if rank == 0:

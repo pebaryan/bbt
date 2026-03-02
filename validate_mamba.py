@@ -46,6 +46,10 @@ def main() -> None:
         d_conv=cfg.get("d_conv", 4),
         expand=cfg.get("expand", 2),
         act_quant=not cfg.get("no_act_quant", False),
+        time_step_min=cfg.get("time_step_min", 1e-3),
+        time_step_max=cfg.get("time_step_max", 1e-1),
+        dt_init=cfg.get("dt_init", "log_uniform"),
+        a_init=cfg.get("a_init", "uniform_0_16"),
     ).to(device)
     model.load_state_dict(ckpt["model"])
     model.eval()

@@ -5,6 +5,7 @@
 - `plot_loss.py`: parse training log and render a loss curve plot.
 - `tag_checkpoint.py`: tag legacy checkpoints with `variant` and `model_family` metadata.
 - `tag_all_checkpoints.py`: scan and tag all legacy checkpoints under a root folder.
+- `migrate_diffusion_steps.py`: resize diffusion `t_emb` for a new `diffusion_steps` value.
 - `run_mamba.ps1`: launch a Mamba training run with timestamped checkpoint output.
 - `run_diffusion.ps1`: launch a diffusion run with timestamped checkpoint output.
 - `legacy/validate.py`: legacy validation helper (now defaults to `artifacts/` paths).

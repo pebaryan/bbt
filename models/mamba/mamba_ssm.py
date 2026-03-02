@@ -27,6 +27,10 @@ class MambaSSM(nn.Module):
         expand: int = 2,
         act_quant: bool = True,
         use_checkpoint: bool = True,
+        time_step_min: float = 1e-3,
+        time_step_max: float = 1e-1,
+        dt_init: str = "log_uniform",
+        a_init: str = "uniform_0_16",
     ):
         """Initialize Mamba SSM.
 
@@ -36,8 +40,22 @@ class MambaSSM(nn.Module):
             d_conv: Convolution kernel size
             expand: Expansion factor for inner dimension
             act_quant: Whether to quantize activations
+            use_checkpoint: Whether to use gradient checkpointing
+            time_step_min: Minimum initial dt value for delta softplus bias
+            time_step_max: Maximum initial dt value for delta softplus bias
+            dt_init: Initialization for delta bias ("log_uniform" or "zeros")
+            a_init: Initialization for A_log ("uniform_0_16" or "log_arange")
         """
         super().__init__()
+        if time_step_min <= 0 or time_step_max <= 0:
+            raise ValueError("time_step_min/time_step_max must be > 0")
+        if time_step_min >= time_step_max:
+            raise ValueError("time_step_min must be < time_step_max")
+        if dt_init not in {"log_uniform", "zeros"}:
+            raise ValueError("dt_init must be one of {'log_uniform', 'zeros'}")
+        if a_init not in {"uniform_0_16", "log_arange"}:
+            raise ValueError("a_init must be one of {'uniform_0_16', 'log_arange'}")
+
         self.d_model = d_model
         self.d_state = d_state
         self.d_conv = d_conv
@@ -63,6 +81,13 @@ class MambaSSM(nn.Module):
         self.delta_proj = BitLinear(
             d_model, self.d_inner, bias=True, act_quant=act_quant
         )
+        self._init_dt_bias(
+            bias=self.delta_proj.bias,
+            d_inner=self.d_inner,
+            time_step_min=time_step_min,
+            time_step_max=time_step_max,
+            dt_init=dt_init,
+        )
 
         # Input-dependent B/C projections into state space
         self.B_proj = BitLinear(d_model, self.d_state, bias=False, act_quant=act_quant)
@@ -74,13 +99,48 @@ class MambaSSM(nn.Module):
         )
 
         # Learnable A matrix: [d_inner, d_state]
-        # Initialize with log-spaced values for stability
-        A = torch.arange(1, d_state + 1, dtype=torch.float32).view(1, -1)
-        A = A.repeat(self.d_inner, 1)  # [d_inner, d_state]
-        self.A_log = nn.Parameter(torch.log(A))
+        if a_init == "uniform_0_16":
+            A_log = torch.empty(self.d_inner, d_state, dtype=torch.float32).uniform_(
+                0.0, 16.0
+            )
+        else:
+            A = torch.arange(1, d_state + 1, dtype=torch.float32).view(1, -1)
+            A = A.repeat(self.d_inner, 1)  # [d_inner, d_state]
+            A_log = torch.log(A)
+        self.A_log = nn.Parameter(A_log)
 
         # D parameter (direct connection)
         self.D = nn.Parameter(torch.ones(self.d_inner))
+
+    @staticmethod
+    def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
+        # Inverse softplus: y = x + log(1 - exp(-x)).
+        # Use expm1 for numerical stability at small x.
+        return x + torch.log(-torch.expm1(-x))
+
+    @classmethod
+    def _init_dt_bias(
+        cls,
+        bias: torch.Tensor | None,
+        d_inner: int,
+        time_step_min: float,
+        time_step_max: float,
+        dt_init: str,
+    ) -> None:
+        if bias is None:
+            return
+        with torch.no_grad():
+            if dt_init == "zeros":
+                bias.zero_()
+                return
+            # Log-uniform in [time_step_min, time_step_max]
+            dt = torch.exp(
+                torch.empty(d_inner).uniform_(
+                    math.log(time_step_min),
+                    math.log(time_step_max),
+                )
+            )
+            bias.copy_(cls._inv_softplus(dt).to(dtype=bias.dtype, device=bias.device))
 
     @staticmethod
     def _ssm_scan(

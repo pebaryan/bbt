@@ -41,6 +41,8 @@ def main() -> None:
     # Get diffusion steps from checkpoint or use default
     diffusion_steps = cfg.get("diffusion_steps", 24)
     mask_token_id = cfg.get("mask_token_id", 256)
+    mask_mode = cfg.get("mask_mode", "token")
+    span_len = float(cfg.get("span_len", 8.0))
 
     model = BitByteDiffusionLM(
         vocab_size=256,
@@ -55,8 +57,9 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    tot_loss = 0.0
+    tot_nll = 0.0
     tot_tokens = 0
+    tot_correct = 0
     amp_ctx = (
         torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
     )
@@ -72,21 +75,34 @@ def main() -> None:
             t = sample_timesteps(x.size(0), diffusion_steps, device)
 
             # Corrupt the input
-            x_t, mask = corrupt_with_mask(x, t, diffusion_steps, mask_token_id)
-
+            x_t, mask = corrupt_with_mask(
+                x,
+                t,
+                diffusion_steps,
+                mask_token_id,
+                mask_mode=mask_mode,
+                span_len=span_len,
+            )
             # Get model predictions
             logits = model(x_t, t)  # shape [1, seq_len, vocab_size]
 
-            # Compute masked denoising loss
+            # Compute masked denoising loss (mean NLL over masked tokens)
             loss = masked_denoise_loss(logits, x, mask)
+            masked_tokens = int(mask.sum().item())
+            preds = torch.argmax(logits, dim=-1)
 
-            tot_loss += float(loss.item())
-            tot_tokens += int(mask.sum().item())
+            # Convert back to total NLL so final BPB is token-level, not double-normalized.
+            tot_nll += float(loss.item()) * masked_tokens
+            tot_tokens += masked_tokens
+            tot_correct += int(((preds == x) & mask).sum().item())
 
-    bpb = (tot_loss / max(1, tot_tokens)) / math.log(2.0)
+    bpb = (tot_nll / max(1, tot_tokens)) / math.log(2.0)
+    acc = tot_correct / max(1, tot_tokens)
     print(
-        f"val bpb {bpb:.4f} on {tot_tokens} masked tokens (diffusion_steps={diffusion_steps})"
+        f"val bpb {bpb:.4f} on {tot_tokens} masked tokens "
+        f"(diffusion_steps={diffusion_steps}, mask_mode={mask_mode}, span_len={span_len})"
     )
+    print(f"masked acc {acc:.4%}")
 
 
 if __name__ == "__main__":

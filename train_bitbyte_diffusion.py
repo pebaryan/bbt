@@ -55,6 +55,19 @@ def _same_path(a: str, b: str) -> bool:
         return os.path.abspath(a) == os.path.abspath(b)
 
 
+def _model_finite_and_l2_norm(model: torch.nn.Module) -> tuple[bool, float]:
+    """Return whether all parameters are finite and the global L2 parameter norm."""
+    total_sq = 0.0
+    for p in model.parameters():
+        if p is None:
+            continue
+        d = p.detach()
+        if not torch.isfinite(d).all():
+            return False, float("inf")
+        total_sq += float(d.float().pow(2).sum().item())
+    return True, math.sqrt(max(0.0, total_sq))
+
+
 def maybe_resume(
     model: torch.nn.Module,
     optimizer: torch.optim.Optimizer,
@@ -125,11 +138,22 @@ def main() -> None:
     ap.add_argument("--use_sdpa", action="store_true")
     ap.add_argument("--no_ckpt", action="store_true")
     ap.add_argument("--no_act_quant", action="store_true")
+    ap.add_argument(
+        "--no_bnb",
+        action="store_true",
+        help="Disable bitsandbytes AdamW8bit and use torch AdamW instead",
+    )
 
     ap.add_argument("--lr", type=float, default=2e-4)
     ap.add_argument("--warmup_frac", type=float, default=0.03)
     ap.add_argument("--wd", type=float, default=0.1)
     ap.add_argument("--grad_clip", type=float, default=1.0)
+    ap.add_argument(
+        "--param_check_every",
+        type=int,
+        default=10,
+        help="Check parameter finiteness/L2 norm every N steps (0 disables)",
+    )
 
     ap.add_argument(
         "--batch_size", type=int, default=1, help="microbatch sequences per GPU"
@@ -178,6 +202,19 @@ def main() -> None:
         help="Mask probability at t=diffusion_steps",
     )
     ap.add_argument(
+        "--mask_mode",
+        type=str,
+        default="token",
+        choices=["token", "span"],
+        help="Masking pattern: random token masking or contiguous span masking",
+    )
+    ap.add_argument(
+        "--span_len",
+        type=float,
+        default=8.0,
+        help="Average span length for --mask_mode span",
+    )
+    ap.add_argument(
         "--smoke_test",
         action="store_true",
         help="Run a tiny 10-step CPU-safe synthetic training loop for CI/testing",
@@ -217,6 +254,10 @@ def main() -> None:
         raise ValueError("--mask_token_id must be >= 256")
     if not (0.0 < args.min_mask_prob <= args.max_mask_prob < 1.0):
         raise ValueError("Mask probabilities must satisfy 0 < min <= max < 1")
+    if args.span_len <= 0:
+        raise ValueError("--span_len must be > 0")
+    if args.param_check_every < 0:
+        raise ValueError("--param_check_every must be >= 0")
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)
     if args.smoke_test:
@@ -253,7 +294,7 @@ def main() -> None:
         lr=args.lr,
         betas=(0.9, 0.95),
         weight_decay=args.wd,
-        use_bnb=(device.type == "cuda"),
+        use_bnb=(device.type == "cuda" and not args.no_bnb),
     )
     scaler = create_grad_scaler()
 
@@ -311,6 +352,7 @@ def main() -> None:
         total_mask_frac = 0.0
         valid_micros = 0
         grad_norm = 0.0
+        param_norm = float("nan")
 
         for micro in range(args.grad_accum):
             if args.smoke_test:
@@ -329,6 +371,8 @@ def main() -> None:
                 mask_token_id=args.mask_token_id,
                 min_mask_prob=args.min_mask_prob,
                 max_mask_prob=args.max_mask_prob,
+                mask_mode=args.mask_mode,
+                span_len=args.span_len,
             )
 
             amp_ctx = (
@@ -377,6 +421,22 @@ def main() -> None:
         scaler.step(opt)
         scaler.update()
 
+        # Periodic parameter sanity check to catch non-finite weights early.
+        should_check_params = (
+            args.param_check_every > 0 and (step % args.param_check_every == 0)
+        )
+        if should_check_params:
+            params_finite, param_norm = _model_finite_and_l2_norm(model)
+            if not params_finite:
+                opt_name = "bitsandbytes AdamW8bit" if use_bnb else "torch AdamW"
+                raise RuntimeError(
+                    f"Non-finite model parameters detected at step {step}. "
+                    f"Optimizer={opt_name}. "
+                    "Training aborted to avoid propagating corrupted weights. "
+                    "Try lowering --lr, disabling --no_bnb, reducing --grad_clip, "
+                    "or resuming from an earlier checkpoint."
+                )
+
         if step % args.log_every == 0:
             denom = max(1, valid_micros)
             loss_avg = total_loss / denom
@@ -391,14 +451,26 @@ def main() -> None:
             if rank == 0:
                 dt = time.time() - t0
                 bpb_masked = loss_avg / math.log(2.0)
+                mask_cfg = (
+                    f"mask_mode {args.mask_mode}"
+                    if args.mask_mode == "token"
+                    else f"mask_mode span(span_len={args.span_len:.1f})"
+                )
                 print(
                     f"step {step:6d}  seq {seq_len:4d}  "
                     f"loss {loss_avg:.4f}  masked_bpb {bpb_masked:.4f}  "
-                    f"mask {mask_avg * 100.0:.1f}%  gn {grad_norm:.2f}  {dt:.1f}s"
+                    f"mask {mask_avg * 100.0:.1f}%  {mask_cfg}  "
+                    f"gn {grad_norm:.2f}  "
+                    f"pn {param_norm:.2e}  {dt:.1f}s"
                 )
             t0 = time.time()
 
         if rank == 0 and (step % args.save_every == 0) and step > 0:
+            params_finite, save_param_norm = _model_finite_and_l2_norm(model)
+            if not params_finite:
+                raise RuntimeError(
+                    f"Refusing to save non-finite checkpoint at step {step}."
+                )
             ckpt = {
                 "step": step,
                 "variant": "diffusion",
@@ -408,7 +480,7 @@ def main() -> None:
                 "args": vars(args),
             }
             torch.save(ckpt, args.out)
-            print(f"saved {args.out}")
+            print(f"saved {args.out} (pn {save_param_norm:.2e})")
 
     if is_ddp:
         dist.destroy_process_group()
