@@ -259,10 +259,12 @@ def masked_denoise_loss(
     mask_f = mask.float()
 
     if loss_type == "vb" and alpha_t is not None and dalpha_t is not None:
-        # Weight from MDLM variational bound: loss_coeff = dalpha / (1 - alpha)
+        # Weight from MDLM variational bound: loss_coeff = -dalpha / (1 - alpha).
+        # dalpha <= 0 (alpha = P(clean) decreases with noise), so negate to keep
+        # the NELBO weight positive.
         alpha = alpha_t.view(-1, 1) if alpha_t.dim() == 1 else alpha_t
         dalpha = dalpha_t.view(-1, 1) if dalpha_t.dim() == 1 else dalpha_t
-        weight = dalpha / (1 - alpha + eps)  # [B, 1]
+        weight = -dalpha / (1 - alpha + eps)  # [B, 1]
         weighted = token_loss * mask_f * weight
         denom = (mask_f * weight).sum().clamp_min(eps)
     else:

@@ -423,7 +423,7 @@ def main() -> None:
             loss_type_for_fn = args.loss_type
             if loss_type_for_fn == "standard":
                 loss_type_for_fn = "uniform"
-            dalpha_t, alpha_t = get_alpha_for_t(t, args.diffusion_steps)
+            alpha_t, dalpha_t = get_alpha_for_t(t, args.diffusion_steps)
 
             amp_ctx = (
                 torch.amp.autocast("cuda", dtype=torch.float16)
