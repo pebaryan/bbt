@@ -227,8 +227,10 @@ def main() -> None:
         default="uniform",
         choices=["uniform", "vb", "standard"],
         help="Loss weighting: 'uniform' = equal weight per masked token (MDLM low_var, "
-             "recommended for training). 'vb' = dalpha/(1-alpha) weighting (variational bound, "
-             "higher variance, use for evaluation). 'standard' = alias for uniform.",
+             "recommended for training). 'vb' = per-sample reweighting by the MDLM "
+             "coefficient -dalpha/(1-alpha), normalized by the weight sum (a weighted "
+             "MEAN of CE that up-weights low-noise steps, not the true NELBO). "
+             "'standard' = alias for uniform.",
     )
     ap.add_argument(
         "--no_antithetic",
@@ -287,8 +289,8 @@ def main() -> None:
     if args.loss_type == "vb" and args.min_mask_prob >= 0.02:
         print(
             f"[INFO] vb loss selected with min_mask_prob={args.min_mask_prob:.3f}. "
-            "At very low mask probabilities the weight dalpha/(1-alpha) is large, "
-            "which may increase gradient variance."
+            "At very low mask probabilities the weight |-dalpha/(1-alpha)| is large, "
+            "skewing the weighted mean toward low-noise timesteps."
         )
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)

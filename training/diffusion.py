@@ -239,7 +239,14 @@ def masked_denoise_loss(
         dalpha_t: Derivative of alpha_t [B] or [B, 1] — used for vb weighting.
         loss_type: One of:
             - "uniform": equal weight per masked token (training default, stable).
-            - "vb": weight by dalpha_t / (1 - alpha_t) (variational bound, higher variance).
+            - "vb": per-sample reweighting by the MDLM coefficient
+              -dalpha_t / (1 - alpha_t), normalized by the sum of weights.
+              This is a *weighted mean* of the per-token CE (up-weights
+              low-noise timesteps), NOT the true variational bound / NELBO:
+              dividing by the weight sum cancels the weight scale. To get the
+              actual NELBO you would normalize by the masked-token count
+              (mask.sum()) instead. Kept as a weighted mean here for training
+              stability — see masked_denoise_loss callers.
         eps: Small constant to avoid division by zero.
 
     Returns:
@@ -259,9 +266,10 @@ def masked_denoise_loss(
     mask_f = mask.float()
 
     if loss_type == "vb" and alpha_t is not None and dalpha_t is not None:
-        # Weight from MDLM variational bound: loss_coeff = -dalpha / (1 - alpha).
-        # dalpha <= 0 (alpha = P(clean) decreases with noise), so negate to keep
-        # the NELBO weight positive.
+        # MDLM coefficient -dalpha / (1 - alpha); dalpha <= 0 (alpha = P(clean)
+        # decreases with noise), so negate to keep the weight positive.
+        # Normalizing by the weight sum below makes this a weighted MEAN of CE
+        # (the weight scale cancels), not the literal NELBO — see docstring.
         alpha = alpha_t.view(-1, 1) if alpha_t.dim() == 1 else alpha_t
         dalpha = dalpha_t.view(-1, 1) if dalpha_t.dim() == 1 else dalpha_t
         weight = -dalpha / (1 - alpha + eps)  # [B, 1]
