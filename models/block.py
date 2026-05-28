@@ -13,7 +13,7 @@ class Block(nn.Module):
     
     Implements a single transformer block with:
     - RMSNorm
-    - Causal self-attention
+    - Causal self-attention (with optional GQA)
     - MLP with SwiGLU
     - Optional gradient checkpointing
     """
@@ -22,7 +22,8 @@ class Block(nn.Module):
         self,
         d_model: int,
         n_head: int,
-        d_ff: int,
+        n_kv_head: int | None = None,
+        d_ff: int = 4096,
         act_quant: bool = True,
         rope_base: float = 10000.0,
         use_sdpa: bool = True,
@@ -33,6 +34,7 @@ class Block(nn.Module):
         Args:
             d_model: Model dimension
             n_head: Number of attention heads
+            n_kv_head: Number of key/value heads for GQA. If None, uses MHA.
             d_ff: Feed-forward dimension
             act_quant: Whether to quantize activations
             rope_base: Base for RoPE calculation
@@ -43,7 +45,7 @@ class Block(nn.Module):
         self.ckpt = ckpt
         self.n1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(
-            d_model, n_head, rope_base=rope_base, act_quant=act_quant, use_sdpa=use_sdpa)
+            d_model, n_head, n_kv_head=n_kv_head, rope_base=rope_base, act_quant=act_quant, use_sdpa=use_sdpa)
         self.n2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, d_ff, act_quant=act_quant)
 

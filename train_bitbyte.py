@@ -104,19 +104,25 @@ class RoPE(nn.Module):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, d_model, n_head, rope_base=10000.0, act_quant=True, use_sdpa=True):
+    def __init__(self, d_model, n_head, n_kv_head=None, rope_base=10000.0, act_quant=True, use_sdpa=True):
         super().__init__()
         assert d_model % n_head == 0
+        if n_kv_head is None:
+            n_kv_head = n_head
+        assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
         self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        self.n_rep = n_head // n_kv_head
         self.head_dim = d_model // n_head
         self.use_sdpa = use_sdpa
 
         self.q_proj = BitLinear(
             d_model, d_model, bias=False, act_quant=act_quant)
+        # K/V projections project to n_kv_head * head_dim (smaller than d_model for GQA)
         self.k_proj = BitLinear(
-            d_model, d_model, bias=False, act_quant=act_quant)
+            d_model, n_kv_head * self.head_dim, bias=False, act_quant=act_quant)
         self.v_proj = BitLinear(
-            d_model, d_model, bias=False, act_quant=act_quant)
+            d_model, n_kv_head * self.head_dim, bias=False, act_quant=act_quant)
         self.o_proj = BitLinear(
             d_model, d_model, bias=False, act_quant=act_quant)
 
@@ -127,14 +133,19 @@ class CausalSelfAttention(nn.Module):
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_head,
                                 self.head_dim).transpose(1, 2)  # [B,H,T,D]
-        k = self.k_proj(x).view(B, T, self.n_head,
-                                self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head,
+        k = self.k_proj(x).view(B, T, self.n_kv_head,
+                                self.head_dim).transpose(1, 2)  # [B,KVH,T,D]
+        v = self.v_proj(x).view(B, T, self.n_kv_head,
                                 self.head_dim).transpose(1, 2)
 
         pos = torch.arange(T, device=x.device)
         q = self.rope(q, pos)
         k = self.rope(k, pos)
+
+        # Repeat K/V heads to match Q heads (GQA)
+        if self.n_rep > 1:
+            k = k[:, :, None, :, :].expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_head, T, self.head_dim)
+            v = v[:, :, None, :, :].expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_head, T, self.head_dim)
 
         if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
             # PyTorch SDPA (may use flash on supported configs)
@@ -173,12 +184,12 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, d_model, n_head, d_ff, act_quant=True, rope_base=10000.0, use_sdpa=True, ckpt=True):
+    def __init__(self, d_model, n_head, d_ff, n_kv_head=None, act_quant=True, rope_base=10000.0, use_sdpa=True, ckpt=True):
         super().__init__()
         self.ckpt = ckpt
         self.n1 = RMSNorm(d_model)
         self.attn = CausalSelfAttention(
-            d_model, n_head, rope_base=rope_base, act_quant=act_quant, use_sdpa=use_sdpa)
+            d_model, n_head, n_kv_head=n_kv_head, rope_base=rope_base, act_quant=act_quant, use_sdpa=use_sdpa)
         self.n2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, d_ff, act_quant=act_quant)
 
@@ -200,14 +211,14 @@ class Block(nn.Module):
 
 class BitByteLM(nn.Module):
     def __init__(self, vocab_size=256, n_layer=24, d_model=1536, n_head=12, d_ff=4096,
-                 act_quant=True, rope_base=10000.0, use_sdpa=True, ckpt=True):
+                 n_kv_head=None, act_quant=True, rope_base=10000.0, use_sdpa=True, ckpt=True):
         super().__init__()
         self.tok_emb = nn.Embedding(vocab_size, d_model)
         # Lower init scale keeps logits in a sane range for fp16.
         nn.init.normal_(self.tok_emb.weight, mean=0.0,
                         std=1.0 / math.sqrt(d_model))
         self.blocks = nn.ModuleList([
-            Block(d_model, n_head, d_ff, act_quant=act_quant,
+            Block(d_model, n_head, d_ff, n_kv_head=n_kv_head, act_quant=act_quant,
                   rope_base=rope_base, use_sdpa=use_sdpa, ckpt=ckpt)
             for _ in range(n_layer)
         ])
@@ -306,6 +317,8 @@ def main():
     ap.add_argument("--n_layer", type=int, default=24)
     ap.add_argument("--d_model", type=int, default=1536)
     ap.add_argument("--n_head", type=int, default=12)
+    ap.add_argument("--n_kv_head", type=int, default=None,
+                    help="Number of KV heads for GQA. If None, uses MHA.")
     ap.add_argument("--d_ff", type=int, default=4096)
 
     ap.add_argument("--ddp", action="store_true", help="Enable DDP (requires torchrun)")
@@ -377,6 +390,7 @@ def main():
         n_layer=args.n_layer,
         d_model=args.d_model,
         n_head=args.n_head,
+        n_kv_head=args.n_kv_head,
         d_ff=args.d_ff,
         act_quant=not args.no_act_quant,
         use_sdpa=args.use_sdpa,

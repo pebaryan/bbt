@@ -68,19 +68,27 @@ class BidirectionalSelfAttention(nn.Module):
         self,
         d_model: int,
         n_head: int,
+        n_kv_head: int | None = None,
         rope_base: float = 10000.0,
         act_quant: bool = True,
         use_sdpa: bool = True,
     ):
         super().__init__()
         assert d_model % n_head == 0
+        if n_kv_head is None:
+            n_kv_head = n_head
+        assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
+
         self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        self.n_rep = n_head // n_kv_head
         self.head_dim = d_model // n_head
         self.use_sdpa = use_sdpa
 
         self.q_proj = BitLinear(d_model, d_model, bias=False, act_quant=act_quant)
-        self.k_proj = BitLinear(d_model, d_model, bias=False, act_quant=act_quant)
-        self.v_proj = BitLinear(d_model, d_model, bias=False, act_quant=act_quant)
+        # K/V projections project to n_kv_head * head_dim (smaller than d_model for GQA)
+        self.k_proj = BitLinear(d_model, n_kv_head * self.head_dim, bias=False, act_quant=act_quant)
+        self.v_proj = BitLinear(d_model, n_kv_head * self.head_dim, bias=False, act_quant=act_quant)
         self.o_proj = BitLinear(d_model, d_model, bias=False, act_quant=act_quant)
         self.rope = RoPE(self.head_dim, base=rope_base)
 
@@ -88,12 +96,17 @@ class BidirectionalSelfAttention(nn.Module):
         bsz, seqlen, d_model = x.shape
 
         q = self.q_proj(x).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(bsz, seqlen, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(bsz, seqlen, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(bsz, seqlen, self.n_kv_head, self.head_dim).transpose(1, 2)
 
         pos = torch.arange(seqlen, device=x.device)
         q = self.rope(q, pos)
         k = self.rope(k, pos)
+
+        # Repeat K/V heads to match Q heads (GQA)
+        if self.n_rep > 1:
+            k = k[:, :, None, :, :].expand(-1, -1, self.n_rep, -1, -1).reshape(bsz, self.n_head, seqlen, self.head_dim)
+            v = v[:, :, None, :, :].expand(-1, -1, self.n_rep, -1, -1).reshape(bsz, self.n_head, seqlen, self.head_dim)
 
         if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
@@ -119,6 +132,7 @@ class DiffusionBlock(nn.Module):
         d_model: int,
         n_head: int,
         d_ff: int,
+        n_kv_head: int | None = None,
         act_quant: bool = True,
         rope_base: float = 10000.0,
         use_sdpa: bool = True,
@@ -130,6 +144,7 @@ class DiffusionBlock(nn.Module):
         self.attn = BidirectionalSelfAttention(
             d_model,
             n_head,
+            n_kv_head=n_kv_head,
             rope_base=rope_base,
             act_quant=act_quant,
             use_sdpa=use_sdpa,
@@ -192,6 +207,7 @@ class BitByteDiffusionLM(nn.Module):
         n_layer: int = 24,
         d_model: int = 1536,
         n_head: int = 12,
+        n_kv_head: int | None = None,
         d_ff: int = 4096,
         act_quant: bool = True,
         rope_base: float = 10000.0,
@@ -219,6 +235,7 @@ class BitByteDiffusionLM(nn.Module):
                 DiffusionBlock(
                     d_model=d_model,
                     n_head=n_head,
+                    n_kv_head=n_kv_head,
                     d_ff=d_ff,
                     act_quant=act_quant,
                     rope_base=rope_base,

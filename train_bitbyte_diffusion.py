@@ -32,6 +32,7 @@ def create_model(args: argparse.Namespace, device: torch.device) -> BitByteDiffu
         n_layer=args.n_layer,
         d_model=args.d_model,
         n_head=args.n_head,
+        n_kv_head=args.n_kv_head,
         d_ff=args.d_ff,
         act_quant=not args.no_act_quant,
         use_sdpa=args.use_sdpa,
@@ -136,6 +137,8 @@ def main() -> None:
     ap.add_argument("--n_layer", type=int, default=24)
     ap.add_argument("--d_model", type=int, default=1536)
     ap.add_argument("--n_head", type=int, default=12)
+    ap.add_argument("--n_kv_head", type=int, default=None,
+                    help="Number of KV heads for GQA. If None, uses MHA.")
     ap.add_argument("--d_ff", type=int, default=4096)
 
     ap.add_argument("--ddp", action="store_true", help="Enable DDP (requires torchrun)")

@@ -14,6 +14,7 @@ class BitByteLM(nn.Module):
     - Ternary quantization with STE
     - RoPE embeddings
     - RMSNorm
+    - Optional GQA (Grouped-Query Attention)
     """
     
     def __init__(
@@ -22,6 +23,7 @@ class BitByteLM(nn.Module):
         n_layer: int = 24,
         d_model: int = 1536,
         n_head: int = 12,
+        n_kv_head: int | None = None,
         d_ff: int = 4096,
         act_quant: bool = True,
         rope_base: float = 10000.0,
@@ -35,6 +37,7 @@ class BitByteLM(nn.Module):
             n_layer: Number of transformer blocks
             d_model: Model dimension
             n_head: Number of attention heads
+            n_kv_head: Number of key/value heads for GQA. If None, uses MHA.
             d_ff: Feed-forward dimension
             act_quant: Whether to quantize activations
             rope_base: Base for RoPE calculation
@@ -47,7 +50,7 @@ class BitByteLM(nn.Module):
         nn.init.normal_(self.tok_emb.weight, mean=0.0,
                         std=1.0 / math.sqrt(d_model))
         self.blocks = nn.ModuleList([
-            Block(d_model, n_head, d_ff, act_quant=act_quant,
+            Block(d_model, n_head, n_kv_head=n_kv_head, d_ff=d_ff, act_quant=act_quant,
                   rope_base=rope_base, use_sdpa=use_sdpa, ckpt=ckpt)
             for _ in range(n_layer)
         ])

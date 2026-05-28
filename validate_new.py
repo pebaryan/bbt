@@ -25,6 +25,7 @@ def load_model(ckpt_path: str, device: torch.device):
         n_layer=cfg.get("n_layer", 24),
         d_model=cfg.get("d_model", 1536),
         n_head=cfg.get("n_head", 12),
+        n_kv_head=cfg.get("n_kv_head", None),
         d_ff=cfg.get("d_ff", 4096),
         act_quant=not cfg.get("no_act_quant", False),
         use_sdpa=cfg.get("use_sdpa", True),
