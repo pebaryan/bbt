@@ -45,7 +45,15 @@ class BitLinear(nn.Module):
         Returns:
             Quantized linear transformation
         """
+        # Force fp32 for numerical stability.
+        # BitLinear's ternary weight quantization (absmean + round) and
+        # per-token activation quantization (amax + round) are numerically
+        # fragile in fp16 — small values get flushed to zero or Inf,
+        # causing NaN gradients that cascade through the model.
+        orig_dtype = x.dtype
+        x32 = x.float()
         if self.act_quant:
-            x = act_quant_per_token(x)
-        wq = TernaryQuantSTE.apply(self.weight)
-        return F.linear(x, wq, self.bias)
+            x32 = act_quant_per_token(x32)
+        wq = TernaryQuantSTE.apply(self.weight.float())
+        out = F.linear(x32, wq, self.bias.float() if self.bias is not None else None)
+        return out.to(orig_dtype)

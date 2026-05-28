@@ -11,6 +11,56 @@ from .mlp import MLP
 from quantization.bitlinear import BitLinear
 
 
+def timestep_embedding(t: torch.Tensor, dim: int, max_period: float = 10000.0) -> torch.Tensor:
+    """Sinusoidal timestep embedding (continuous).
+
+    Args:
+        t: Float tensor [B] with values in (0, 1].
+        dim: Output dimension (should be even).
+        max_period: Maximum period for the sinusoidal frequencies.
+
+    Returns:
+        [B, dim] sinusoidal embedding.
+    """
+    half = dim // 2
+    freqs = torch.exp(-math.log(max_period) * torch.arange(half, device=t.device) / half)
+    args = t[:, None] * freqs[None, :]  # [B, half]
+    return torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+
+
+class AdaLNModulation(nn.Module):
+    """Predicts scale, shift, and gate from noise embedding for AdaLN.
+
+    For each of the two sub-layers (attention, MLP), produces and returns
+    three modulation parameters: shift, scale, and gate (residual scaling).
+
+    The gate is zero-initialized so the block starts as identity,
+    providing stable training from initialization (DiT-style).
+    """
+
+    def __init__(self, d_model: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.SiLU(),
+            nn.Linear(d_model, 6 * d_model),  # γ₁, β₁, γ₂, β₂, α₁, α₂
+        )
+        # Zero-init for stable training start (block acts as identity)
+        nn.init.zeros_(self.net[1].weight)
+        nn.init.zeros_(self.net[1].bias)
+
+    def forward(self, c: torch.Tensor) -> tuple[torch.Tensor, ...]:
+        """Produce 6 modulation tensors from conditioning vector c.
+
+        Args:
+            c: [B, d_model] conditioning vector (timestep embedding).
+
+        Returns:
+            Tuple of 6 tensors, each [B, d_model]:
+            (shift_attn, scale_attn, gate_attn, shift_mlp, scale_mlp, gate_mlp)
+        """
+        return self.net(c).chunk(6, dim=-1)
+
+
 class BidirectionalSelfAttention(nn.Module):
     """Self-attention without causal masking for denoising models."""
 
@@ -57,7 +107,12 @@ class BidirectionalSelfAttention(nn.Module):
 
 
 class DiffusionBlock(nn.Module):
-    """Transformer block for denoising diffusion."""
+    """Transformer block with AdaLN modulation for diffusion conditioning.
+
+    Uses adaptive layer norm (AdaLN) with gate scaling, following DiT.
+    Each block receives a noise-encoding vector c that modulates the
+    normalisation and residual scaling.
+    """
 
     def __init__(
         self,
@@ -71,7 +126,7 @@ class DiffusionBlock(nn.Module):
     ):
         super().__init__()
         self.ckpt = ckpt
-        self.n1 = RMSNorm(d_model)
+        self.n1 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.attn = BidirectionalSelfAttention(
             d_model,
             n_head,
@@ -79,32 +134,60 @@ class DiffusionBlock(nn.Module):
             act_quant=act_quant,
             use_sdpa=use_sdpa,
         )
-        self.n2 = RMSNorm(d_model)
+        self.n2 = nn.LayerNorm(d_model, elementwise_affine=False)
         self.mlp = MLP(d_model, d_ff, act_quant=act_quant)
+        self.adaLN = AdaLNModulation(d_model)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        def attn_fn(inp: torch.Tensor) -> torch.Tensor:
-            return inp + self.attn(self.n1(inp))
+    def _forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Core forward with AdaLN modulation.
 
-        def mlp_fn(inp: torch.Tensor) -> torch.Tensor:
-            return inp + self.mlp(self.n2(inp))
+        Args:
+            x: Token embeddings [B, T, d_model].
+            c: Conditioning vector [B, d_model].
 
-        if self.ckpt and self.training:
-            x = checkpoint(attn_fn, x, use_reentrant=False)
-            x = checkpoint(mlp_fn, x, use_reentrant=False)
-        else:
-            x = attn_fn(x)
-            x = mlp_fn(x)
+        Returns:
+            Output [B, T, d_model].
+        """
+        # Compute modulation in fp32 for numerical stability.
+        # AdaLN gates are zero-initialized and produce small values early
+        # in training; fp16 rounding causes NaN cascades with BitLinear.
+        orig_dtype = x.dtype
+        (
+            shift_attn, scale_attn, gate_attn,
+            shift_mlp, scale_mlp, gate_mlp,
+        ) = self.adaLN(c.float())
+
+        # Pre-modulate: elementwise affine on the normalised input
+        # Shape: x [B,T,D], modulation [B,D] → unsqueeze(1) → [B,1,D]
+        mod_attn = self.n1(x).float() * (1 + scale_attn.unsqueeze(1)) + shift_attn.unsqueeze(1)
+        x = x + gate_attn.unsqueeze(1).to(orig_dtype) * self.attn(mod_attn.to(orig_dtype))
+
+        mod_mlp = self.n2(x).float() * (1 + scale_mlp.unsqueeze(1)) + shift_mlp.unsqueeze(1)
+        x = x + gate_mlp.unsqueeze(1).to(orig_dtype) * self.mlp(mod_mlp.to(orig_dtype))
+
         return x
+
+    def forward(self, x: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+        """Forward pass with optional gradient checkpointing."""
+        if self.ckpt and self.training:
+            return checkpoint(self._forward, x, c, use_reentrant=False)
+        return self._forward(x, c)
 
 
 class BitByteDiffusionLM(nn.Module):
-    """Byte denoising model conditioned on diffusion timestep."""
+    """Byte denoising model conditioned on continuous diffusion timestep.
+
+    Architecture changes vs original bbt diffusion:
+    - Sinusoidal timestep embedding (continuous) instead of learned discrete Embedding
+    - Per-block AdaLN modulation (scale, shift, gate) in every DiffusionBlock
+      instead of single additive t_emb at input
+    - LayerNorm (elementwise_affine=False) + AdaLN instead of RMSNorm
+    - Cosine noise schedule with weighted loss in training loop
+    """
 
     def __init__(
         self,
         vocab_size: int = 256,
-        mask_token_id: int = 256,
         num_diffusion_steps: int = 64,
         n_layer: int = 24,
         d_model: int = 1536,
@@ -116,20 +199,20 @@ class BitByteDiffusionLM(nn.Module):
         ckpt: bool = True,
     ):
         super().__init__()
-        if mask_token_id < vocab_size:
-            raise ValueError("mask_token_id must be >= vocab_size")
 
         self.vocab_size = vocab_size
-        self.mask_token_id = mask_token_id
         self.num_diffusion_steps = num_diffusion_steps
 
-        in_vocab_size = mask_token_id + 1
-        self.tok_emb = nn.Embedding(in_vocab_size, d_model)
+        self.tok_emb = nn.Embedding(vocab_size + 1, d_model)  # +1 for mask token at index = vocab_size
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
 
-        # t in [1..num_diffusion_steps], keep index 0 available for convenience.
-        self.t_emb = nn.Embedding(num_diffusion_steps + 1, d_model)
-        nn.init.normal_(self.t_emb.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
+        # Sinusoidal timestep embedding + MLP projection
+        # Produces a conditioning vector c for all AdaLN blocks
+        self.t_embed = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.SiLU(),
+            nn.Linear(d_model, d_model),
+        )
 
         self.blocks = nn.ModuleList(
             [
@@ -145,18 +228,18 @@ class BitByteDiffusionLM(nn.Module):
                 for _ in range(n_layer)
             ]
         )
-        self.norm_f = RMSNorm(d_model)
+        self.norm_f = nn.LayerNorm(d_model, elementwise_affine=False)
         self.lm_head = nn.Linear(d_model, vocab_size, bias=False)
 
     def forward(self, x_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
         """Predict clean byte logits from corrupted sequence and timestep.
 
         Args:
-            x_t: Corrupted byte tokens [B, T]
-            t: Diffusion step [B], expected range [1, num_diffusion_steps]
+            x_t: Corrupted byte tokens [B, T].
+            t: Diffusion step [B], expected range [1, num_diffusion_steps].
 
         Returns:
-            Logits over clean bytes [B, T, vocab_size]
+            Logits over clean bytes [B, T, vocab_size].
         """
         if t.ndim == 0:
             t = t.unsqueeze(0)
@@ -165,8 +248,14 @@ class BitByteDiffusionLM(nn.Module):
         if x_t.size(0) != t.size(0):
             raise ValueError("batch size mismatch between x_t and t")
 
-        x = self.tok_emb(x_t) + self.t_emb(t)[:, None, :]
+        # Convert discrete timestep to continuous in (0, 1]
+        t_cont = t.float() / float(max(1, self.num_diffusion_steps))
+        # Build sinusoidal embedding → MLP → conditioning vector (fp32 for stability)
+        t_sin = timestep_embedding(t_cont, self.t_embed[0].in_features)
+        c = self.t_embed(t_sin)  # [B, d_model]
+
+        x = self.tok_emb(x_t)  # [B, T, d_model]
         for blk in self.blocks:
-            x = blk(x)
+            x = blk(x, c)
         x = self.norm_f(x)
         return self.lm_head(x)

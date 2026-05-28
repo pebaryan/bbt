@@ -45,7 +45,6 @@ def load_model(
         n_head=_ckpt_arg(cfg, "n_head", 5),
         d_ff=_ckpt_arg(cfg, "d_ff", 640),
         num_diffusion_steps=num_diffusion_steps,
-        mask_token_id=mask_token_id,
         act_quant=not _ckpt_arg(cfg, "no_act_quant", False),
         use_sdpa=_ckpt_arg(cfg, "use_sdpa", False),
         ckpt=not _ckpt_arg(cfg, "no_ckpt", False),

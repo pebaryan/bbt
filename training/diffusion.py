@@ -69,14 +69,52 @@ def _build_span_mask(
     return mask
 
 
+# ─── Noise schedule ───────────────────────────────────────────────────────────
+
+def get_noise_schedule(t_norm: torch.Tensor, eps: float = 0.001) -> tuple[torch.Tensor, torch.Tensor]:
+    """CosineSquared noise schedule adapted from MDLM/SFM.
+
+    Args:
+        t_norm: Float tensor in [0, 1], t=0 = clean, t=1 = max noise.
+        eps: Minimum alpha (prevent masking everything with prob=1).
+
+    Returns:
+        alpha_t:  [*t_norm.shape] probability a token stays clean at timestep t.
+        dalpha_t: Derivative of alpha_t w.r.t. t_norm.
+    """
+    angle = (math.pi / 2) * (1 - t_norm)
+    sin_a = torch.sin(angle)
+    cos_a = torch.cos(angle)
+
+    base_alpha = sin_a ** 2                                      # sin²(π/2 · (1-t))
+    alpha = eps + (1 - eps) * base_alpha                         # scaled to [eps, 1]
+
+    dalpha = -(1 - eps) * 2 * sin_a * cos_a * (math.pi / 2)      # derivative
+    return alpha, dalpha
+
+
 def sample_timesteps(
     batch_size: int,
     num_diffusion_steps: int,
     device: torch.device,
+    antithetic: bool = True,
 ) -> torch.Tensor:
-    """Uniformly sample timesteps in [1, num_diffusion_steps]."""
-    return torch.randint(1, num_diffusion_steps + 1, (batch_size,), device=device, dtype=torch.long)
+    """Sample timesteps in [1, num_diffusion_steps].
 
+    With antithetic=True, uses stratified sampling for more uniform coverage
+    of the timestep range (following MDLM/SFM).
+    """
+    if antithetic:
+        eps = torch.rand(batch_size, device=device)
+        offset = torch.arange(batch_size, device=device).float() / batch_size
+        t_cont = (eps / batch_size + offset).clamp(0.0, 1.0 - 1e-6)
+        t = (t_cont * num_diffusion_steps).long().clamp(1, num_diffusion_steps)
+    else:
+        t = torch.randint(1, num_diffusion_steps + 1, (batch_size,), device=device, dtype=torch.long)
+    return t
+
+
+# ─── Mask corruption ─────────────────────────────────────────────────────────
 
 def mask_prob_for_t(
     t: torch.Tensor,
@@ -84,9 +122,33 @@ def mask_prob_for_t(
     min_mask_prob: float,
     max_mask_prob: float,
 ) -> torch.Tensor:
-    """Linear mask schedule from low noise (small t) to high noise (large t)."""
-    frac = t.float() / float(max(1, num_diffusion_steps))
-    return min_mask_prob + (max_mask_prob - min_mask_prob) * frac
+    """Mask probability from CosineSquared noise schedule.
+
+    Uses alpha_t = P(token stays clean), so mask_prob = 1 - alpha_t.
+    Clamped to [min_mask_prob, max_mask_prob].
+
+    Args:
+        t: Timestep tensor [B], values in [1, num_diffusion_steps].
+        num_diffusion_steps: Total diffusion steps.
+        min_mask_prob: Minimum mask probability (floor).
+        max_mask_prob: Maximum mask probability (ceiling).
+
+    Returns:
+        Mask probability for each sample, shape [B].
+    """
+    t_norm = t.float() / float(max(1, num_diffusion_steps))  # → [1/T, 1]
+    alpha, _ = get_noise_schedule(t_norm)
+    mask_prob = 1.0 - alpha
+    return mask_prob.clamp(min_mask_prob, max_mask_prob)
+
+
+def get_alpha_for_t(
+    t: torch.Tensor,
+    num_diffusion_steps: int,
+):
+    """Return (alpha_t, dalpha_t) for timestep tensor t."""
+    t_norm = t.float() / float(max(1, num_diffusion_steps))
+    return get_noise_schedule(t_norm)
 
 
 def corrupt_with_mask(
@@ -94,12 +156,30 @@ def corrupt_with_mask(
     t: torch.Tensor,
     num_diffusion_steps: int,
     mask_token_id: int,
-    min_mask_prob: float = 0.05,
-    max_mask_prob: float = 0.5,
+    min_mask_prob: float = 0.01,
+    max_mask_prob: float = 0.99,
     mask_mode: str = "token",
     span_len: float = 8.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Corrupt clean bytes by replacing random positions with mask token."""
+    """Corrupt clean bytes by replacing random positions with mask token.
+
+    Uses cosine-based masking schedule: at low t, few tokens are masked;
+    at high t, most tokens are masked.
+
+    Args:
+        x0: Clean byte tokens [B, T].
+        t: Timesteps [B], values in [1, num_diffusion_steps].
+        num_diffusion_steps: Total diffusion steps.
+        mask_token_id: Special mask token ID.
+        min_mask_prob: Floor mask probability (default 0.01).
+        max_mask_prob: Ceiling mask probability (default 0.99).
+        mask_mode: "token" for random token masking, "span" for contiguous spans.
+        span_len: Average span length for span masking.
+
+    Returns:
+        x_t: Corrupted sequence [B, T].
+        mask: Boolean mask of corrupted positions [B, T].
+    """
     if x0.ndim != 2:
         raise ValueError("x0 must have shape [B, T]")
     if t.ndim != 1:
@@ -138,12 +218,33 @@ def corrupt_with_mask(
     return x_t, mask
 
 
+# ─── Loss ─────────────────────────────────────────────────────────────────────
+
 def masked_denoise_loss(
     logits: torch.Tensor,
     targets: torch.Tensor,
     mask: torch.Tensor,
+    alpha_t: torch.Tensor | None = None,
+    dalpha_t: torch.Tensor | None = None,
+    loss_type: str = "standard",
+    eps: float = 1e-8,
 ) -> torch.Tensor:
-    """Cross-entropy on masked positions only."""
+    """Cross-entropy on masked positions, optionally weighted by noise schedule.
+
+    Args:
+        logits: Model predictions [B, T, V].
+        targets: Clean byte tokens [B, T].
+        mask: Boolean mask of corrupted positions [B, T].
+        alpha_t: P(token stays clean) [B] or [B, 1] — used for vb weighting.
+        dalpha_t: Derivative of alpha_t [B] or [B, 1] — used for vb weighting.
+        loss_type: One of:
+            - "uniform": equal weight per masked token (training default, stable).
+            - "vb": weight by dalpha_t / (1 - alpha_t) (variational bound, higher variance).
+        eps: Small constant to avoid division by zero.
+
+    Returns:
+        Scalar loss.
+    """
     if logits.ndim != 3:
         raise ValueError("logits must have shape [B, T, V]")
     if targets.ndim != 2 or mask.ndim != 2:
@@ -153,8 +254,20 @@ def masked_denoise_loss(
         logits.reshape(-1, logits.size(-1)),
         targets.reshape(-1),
         reduction="none",
-    ).view_as(targets)
+    ).view_as(targets)  # [B, T]
 
     mask_f = mask.float()
-    denom = mask_f.sum().clamp_min(1.0)
-    return (token_loss * mask_f).sum() / denom
+
+    if loss_type == "vb" and alpha_t is not None and dalpha_t is not None:
+        # Weight from MDLM variational bound: loss_coeff = dalpha / (1 - alpha)
+        alpha = alpha_t.view(-1, 1) if alpha_t.dim() == 1 else alpha_t
+        dalpha = dalpha_t.view(-1, 1) if dalpha_t.dim() == 1 else dalpha_t
+        weight = dalpha / (1 - alpha + eps)  # [B, 1]
+        weighted = token_loss * mask_f * weight
+        denom = (mask_f * weight).sum().clamp_min(eps)
+    else:
+        # Uniform: equal weight across all timesteps
+        weighted = token_loss * mask_f
+        denom = mask_f.sum().clamp_min(1.0)
+
+    return weighted.sum() / denom

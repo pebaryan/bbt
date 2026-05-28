@@ -14,7 +14,12 @@ import torch.distributed as dist
 from data.byte_shard_dataset import ByteShardDataset
 from models.bitbyte_diffusion import BitByteDiffusionLM
 from training.ddp import setup_ddp
-from training.diffusion import corrupt_with_mask, masked_denoise_loss, sample_timesteps
+from training.diffusion import (
+    corrupt_with_mask,
+    masked_denoise_loss,
+    sample_timesteps,
+    get_alpha_for_t,
+)
 from training.lr_scheduler import lr_for_step, seq_len_for_step
 from utils.optim import create_grad_scaler, create_optimizer
 
@@ -22,7 +27,6 @@ from utils.optim import create_grad_scaler, create_optimizer
 def create_model(args: argparse.Namespace, device: torch.device) -> BitByteDiffusionLM:
     model = BitByteDiffusionLM(
         vocab_size=256,
-        mask_token_id=args.mask_token_id,
         num_diffusion_steps=args.diffusion_steps,
         n_layer=args.n_layer,
         d_model=args.d_model,
@@ -137,7 +141,10 @@ def main() -> None:
 
     ap.add_argument("--use_sdpa", action="store_true")
     ap.add_argument("--no_ckpt", action="store_true")
-    ap.add_argument("--no_act_quant", action="store_true")
+    ap.add_argument(
+        "--no_act_quant",
+        action="store_true",
+    )
     ap.add_argument(
         "--no_bnb",
         action="store_true",
@@ -192,14 +199,14 @@ def main() -> None:
     ap.add_argument(
         "--min_mask_prob",
         type=float,
-        default=0.05,
-        help="Mask probability at t=1",
+        default=0.01,
+        help="Mask probability at lowest noise (default 0.01 for cosine schedule)",
     )
     ap.add_argument(
         "--max_mask_prob",
         type=float,
-        default=0.50,
-        help="Mask probability at t=diffusion_steps",
+        default=0.99,
+        help="Mask probability at highest noise (default 0.99 for cosine schedule)",
     )
     ap.add_argument(
         "--mask_mode",
@@ -213,6 +220,25 @@ def main() -> None:
         type=float,
         default=8.0,
         help="Average span length for --mask_mode span",
+    )
+    ap.add_argument(
+        "--loss_type",
+        type=str,
+        default="uniform",
+        choices=["uniform", "vb", "standard"],
+        help="Loss weighting: 'uniform' = equal weight per masked token (MDLM low_var, "
+             "recommended for training). 'vb' = dalpha/(1-alpha) weighting (variational bound, "
+             "higher variance, use for evaluation). 'standard' = alias for uniform.",
+    )
+    ap.add_argument(
+        "--no_antithetic",
+        action="store_true",
+        help="Disable antithetic timestep sampling (falls back to uniform)",
+    )
+    ap.add_argument(
+        "--no_amp",
+        action="store_true",
+        help="Disable automatic mixed precision (fp16). Use fp32 instead.",
     )
     ap.add_argument(
         "--smoke_test",
@@ -258,6 +284,12 @@ def main() -> None:
         raise ValueError("--span_len must be > 0")
     if args.param_check_every < 0:
         raise ValueError("--param_check_every must be >= 0")
+    if args.loss_type == "vb" and args.min_mask_prob >= 0.02:
+        print(
+            f"[INFO] vb loss selected with min_mask_prob={args.min_mask_prob:.3f}. "
+            "At very low mask probabilities the weight dalpha/(1-alpha) is large, "
+            "which may increase gradient variance."
+        )
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)
     if args.smoke_test:
@@ -300,6 +332,14 @@ def main() -> None:
 
     if rank == 0:
         print(f"Using {'bitsandbytes AdamW8bit' if use_bnb else 'torch AdamW'}")
+        print(f"Cosine mask schedule: [{args.min_mask_prob} .. {args.max_mask_prob}]")
+        loss_type_display = args.loss_type
+        if loss_type_display == "standard":
+            loss_type_display = "uniform"
+        print(f"Loss type: {loss_type_display}")
+        print(f"Antithetic sampling: {not args.no_antithetic}")
+        print(f"Model: {args.n_layer} layers, d_model={args.d_model}, {args.n_head} heads")
+        print(f"Diffusion steps: {args.diffusion_steps}")
 
     start_step = maybe_resume(
         model=model,
@@ -363,7 +403,12 @@ def main() -> None:
                 x0, _ = next(it)
                 x0 = x0.to(device, non_blocking=True)
 
-            t = sample_timesteps(x0.size(0), args.diffusion_steps, device=device)
+            t = sample_timesteps(
+                x0.size(0),
+                args.diffusion_steps,
+                device=device,
+                antithetic=not args.no_antithetic,
+            )
             x_t, mask = corrupt_with_mask(
                 x0=x0,
                 t=t,
@@ -375,14 +420,26 @@ def main() -> None:
                 span_len=args.span_len,
             )
 
+            loss_type_for_fn = args.loss_type
+            if loss_type_for_fn == "standard":
+                loss_type_for_fn = "uniform"
+            dalpha_t, alpha_t = get_alpha_for_t(t, args.diffusion_steps)
+
             amp_ctx = (
                 torch.amp.autocast("cuda", dtype=torch.float16)
-                if device.type == "cuda"
+                if device.type == "cuda" and not args.no_amp
                 else nullcontext()
             )
             with amp_ctx:
                 logits = model(x_t, t)
-                raw_loss = masked_denoise_loss(logits=logits, targets=x0, mask=mask)
+                raw_loss = masked_denoise_loss(
+                    logits=logits,
+                    targets=x0,
+                    mask=mask,
+                    alpha_t=alpha_t,
+                    dalpha_t=dalpha_t,
+                    loss_type=args.loss_type,
+                )
                 loss = raw_loss / args.grad_accum
 
             if not torch.isfinite(loss):
