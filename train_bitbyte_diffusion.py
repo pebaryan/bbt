@@ -20,6 +20,7 @@ from training.diffusion import (
     sample_timesteps,
     get_alpha_for_t,
 )
+from training.eval import run_diffusion_validation
 from training.lr_scheduler import lr_for_step, seq_len_for_step
 from utils.optim import create_grad_scaler, create_optimizer
 
@@ -252,6 +253,30 @@ def main() -> None:
         action="store_true",
         help="Allow overwriting --out when file already exists",
     )
+    ap.add_argument(
+        "--val_data",
+        type=str,
+        default=None,
+        help="Path to a directory of validation shard_*.bin files",
+    )
+    ap.add_argument(
+        "--val_every",
+        type=int,
+        default=0,
+        help="Run validation every N steps (0 disables)",
+    )
+    ap.add_argument(
+        "--val_batches",
+        type=int,
+        default=100,
+        help="Number of validation batches (batch_size=1) when validation is enabled",
+    )
+    ap.add_argument(
+        "--val_seq_len",
+        type=int,
+        default=2048,
+        help="Fixed sequence length for validation (constant for comparable curves)",
+    )
 
     args = ap.parse_args()
 
@@ -286,6 +311,12 @@ def main() -> None:
         raise ValueError("--span_len must be > 0")
     if args.param_check_every < 0:
         raise ValueError("--param_check_every must be >= 0")
+    if args.val_every < 0:
+        raise ValueError("--val_every must be >= 0")
+    if args.val_batches < 0:
+        raise ValueError("--val_batches must be >= 0")
+    if args.val_every > 0 and not args.val_data:
+        raise ValueError("--val_data is required when --val_every > 0")
     if args.loss_type == "vb" and args.min_mask_prob >= 0.02:
         print(
             f"[INFO] vb loss selected with min_mask_prob={args.min_mask_prob:.3f}. "
@@ -361,6 +392,19 @@ def main() -> None:
             ds, batch_size=args.batch_size, num_workers=0, pin_memory=True
         )
         it = iter(dl)
+
+    val_dl = None
+    if args.val_data:
+        val_ds = ByteShardDataset(
+            shard_glob=os.path.join(args.val_data, "shard_*.bin"),
+            seq_len=args.val_seq_len,
+            seed=5678,
+            rank=rank,
+            world_size=world_size,
+        )
+        val_dl = torch.utils.data.DataLoader(
+            val_ds, batch_size=1, num_workers=0, pin_memory=True
+        )
 
     warmup_steps = int(args.steps * args.warmup_frac)
     t0 = time.time()
@@ -540,6 +584,26 @@ def main() -> None:
             }
             torch.save(ckpt, args.out)
             print(f"saved {args.out} (pn {save_param_norm:.2e})")
+
+        if args.val_every > 0 and (step % args.val_every == 0) and step > 0:
+            res = run_diffusion_validation(
+                model, val_dl, device,
+                max_batches=args.val_batches,
+                is_ddp=is_ddp,
+                diffusion_steps=args.diffusion_steps,
+                mask_token_id=args.mask_token_id,
+                min_mask_prob=args.min_mask_prob,
+                max_mask_prob=args.max_mask_prob,
+                mask_mode=args.mask_mode,
+                span_len=args.span_len,
+                use_amp=(device.type == "cuda" and not args.no_amp),
+            )
+            if rank == 0:
+                print(
+                    f"val  step {step:6d}  seq {args.val_seq_len:4d}  "
+                    f"loss {res.loss:.4f}  bpb {res.bits_per_byte:.4f}  "
+                    f"acc {res.accuracy:.4%}  tokens {res.num_tokens}"
+                )
 
     if is_ddp:
         dist.destroy_process_group()

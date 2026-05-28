@@ -1,14 +1,12 @@
 #!/usr/bin/env python3
 """Validation script for Diffusion models."""
 import argparse
-import math
-from contextlib import nullcontext
 
 import torch
 
 from data.byte_shard_dataset import ByteShardDataset
 from models.bitbyte_diffusion import BitByteDiffusionLM
-from training.diffusion import corrupt_with_mask, masked_denoise_loss, sample_timesteps
+from training.eval import run_diffusion_validation
 
 
 def main() -> None:
@@ -59,53 +57,24 @@ def main() -> None:
     model.load_state_dict(ckpt["model"])
     model.eval()
 
-    tot_nll = 0.0
-    tot_tokens = 0
-    tot_correct = 0
-    amp_ctx = (
-        torch.amp.autocast("cuda", dtype=torch.float16) if use_amp else nullcontext()
+    res = run_diffusion_validation(
+        model, dl, device,
+        max_batches=args.batches,
+        is_ddp=False,
+        diffusion_steps=diffusion_steps,
+        mask_token_id=mask_token_id,
+        min_mask_prob=min_mask_prob,
+        max_mask_prob=max_mask_prob,
+        mask_mode=mask_mode,
+        span_len=span_len,
+        use_amp=use_amp,
     )
-    with torch.no_grad(), amp_ctx:
-        for i, (x, y) in enumerate(dl):
-            if i >= args.batches:
-                break
-            x = x.to(device)  # shape [1, seq_len]
-
-            # Sample a timestep
-            t = sample_timesteps(x.size(0), diffusion_steps, device)
-
-            # Corrupt the input with cosine mask schedule
-            x_t, mask = corrupt_with_mask(
-                x,
-                t,
-                diffusion_steps,
-                mask_token_id,
-                min_mask_prob=min_mask_prob,
-                max_mask_prob=max_mask_prob,
-                mask_mode=mask_mode,
-                span_len=span_len,
-            )
-            # Get model predictions
-            logits = model(x_t, t)  # shape [1, seq_len, vocab_size]
-
-            # Compute masked denoising loss (mean NLL over masked tokens)
-            loss = masked_denoise_loss(logits, x, mask)
-            masked_tokens = int(mask.sum().item())
-            preds = torch.argmax(logits, dim=-1)
-
-            # Convert back to total NLL so final BPB is token-level
-            tot_nll += float(loss.item()) * masked_tokens
-            tot_tokens += masked_tokens
-            tot_correct += int(((preds == x) & mask).sum().item())
-
-    bpb = (tot_nll / max(1, tot_tokens)) / math.log(2.0)
-    acc = tot_correct / max(1, tot_tokens)
     print(
-        f"val bpb {bpb:.4f} on {tot_tokens} masked tokens "
+        f"val bpb {res.bits_per_byte:.4f} on {res.num_tokens} masked tokens "
         f"(diffusion_steps={diffusion_steps}, mask_mode={mask_mode}, "
         f"mask_range=[{min_mask_prob:.2f},{max_mask_prob:.2f}])"
     )
-    print(f"masked acc {acc:.4%}")
+    print(f"masked acc {res.accuracy:.4%}")
 
 
 if __name__ == "__main__":

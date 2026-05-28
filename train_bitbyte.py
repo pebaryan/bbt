@@ -10,6 +10,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.checkpoint import checkpoint
 from byte_shard_dataset import ByteShardDataset
+from training.eval import run_ar_validation
 
 # -------------------------
 # Ternary quant + STE
@@ -331,11 +332,26 @@ def main():
                     help="When resuming, load model weights only (fresh optimizer/scaler).")
     ap.add_argument("--log_byte_class_loss", action="store_true",
                     help="Log separate loss for whitespace vs non-whitespace target bytes.")
+    ap.add_argument("--val_data", type=str, default=None,
+                    help="Path to validation shard directory (contains shard_*.bin).")
+    ap.add_argument("--val_every", type=int, default=0,
+                    help="Run validation every N steps (0 disables).")
+    ap.add_argument("--val_batches", type=int, default=100,
+                    help="Number of validation batches to run when validation is enabled.")
+    ap.add_argument("--val_seq_len", type=int, default=2048,
+                    help="Fixed sequence length for validation (constant for comparable curves).")
 
     args = ap.parse_args()
 
     rank, local_rank, world_size, is_ddp = setup_ddp(args.ddp)
     device = torch.device("cuda", local_rank)
+
+    if args.val_every < 0:
+        raise ValueError("--val_every must be >= 0")
+    if args.val_batches < 0:
+        raise ValueError("--val_batches must be >= 0")
+    if args.val_every > 0 and not args.val_data:
+        raise ValueError("--val_data is required when --val_every > 0")
 
 
     # Curriculum schedule (by step fraction)
@@ -420,6 +436,18 @@ def main():
 
     dl = torch.utils.data.DataLoader(
         ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
+    val_ds = None
+    val_dl = None
+    if args.val_data:
+        val_ds = ByteShardDataset(
+            shard_glob=os.path.join(args.val_data, "shard_*.bin"),
+            seq_len=args.val_seq_len,
+            seed=5678,
+            rank=rank,
+            world_size=world_size,
+        )
+        val_dl = torch.utils.data.DataLoader(
+            val_ds, batch_size=1, num_workers=0, pin_memory=True)
 
     warmup_steps = int(args.steps * args.warmup_frac)
 
@@ -551,6 +579,20 @@ def main():
             }
             torch.save(ckpt, args.out)
             print(f"saved {args.out}")
+
+        if args.val_every > 0 and (step % args.val_every == 0) and step > 0:
+            res = run_ar_validation(
+                model, val_dl, device,
+                max_batches=args.val_batches,
+                is_ddp=is_ddp,
+                use_amp=(device.type == "cuda"),
+            )
+            if rank == 0:
+                print(
+                    f"val  step {step:6d}  seq {args.val_seq_len:4d}  "
+                    f"loss {res.loss:.4f}  bpb {res.bits_per_byte:.4f}  "
+                    f"ppl {res.perplexity:.2f}  tokens {res.num_tokens}"
+                )
 
     if is_ddp:
         dist.destroy_process_group()
