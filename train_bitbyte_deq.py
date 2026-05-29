@@ -12,6 +12,7 @@ Default is full precision (nn.Linear) to de-risk the DEQ dynamics; pass
 import argparse
 import math
 import os
+import tempfile
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -30,6 +31,9 @@ def build_args():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default=None, help="Dir of training shard_*.bin")
     ap.add_argument("--out", type=str, default="artifacts/checkpoints/deq/ckpt_deq.pt")
+    ap.add_argument("--resume", type=str, default=None, help="Resume from checkpoint path")
+    ap.add_argument("--no_opt_state", action="store_true",
+                    help="When resuming, load model weights only (fresh optimizer/scaler)")
     ap.add_argument("--steps", type=int, default=20000)
     ap.add_argument("--log_every", type=int, default=50)
     ap.add_argument("--save_every", type=int, default=2000)
@@ -78,7 +82,11 @@ def build_args():
     ap.add_argument("--grad_clip", type=float, default=1.0)
     ap.add_argument("--batch_size", type=int, default=4)
     ap.add_argument("--grad_accum", type=int, default=1)
-    ap.add_argument("--seq_len", type=int, default=1024)
+    ap.add_argument("--seq_len", type=int, default=None,
+                    help="Fixed sequence length for all steps (disables curriculum). "
+                         "Default: curriculum via seq_len_for_step capped by --seq_len_cap.")
+    ap.add_argument("--seq_len_cap", type=int, default=1024,
+                    help="Upper bound on curriculum sequence length (default 1024).")
 
     ap.add_argument("--val_data", type=str, default=None)
     ap.add_argument("--val_every", type=int, default=0)
@@ -89,6 +97,20 @@ def build_args():
                     help="Tiny CPU synthetic run for CI/testing")
     ap.add_argument("--allow_overwrite", action="store_true")
     return ap.parse_args()
+
+
+def _save_atomic(ckpt: dict, path: str) -> None:
+    out_parent = os.path.dirname(path)
+    if out_parent:
+        os.makedirs(out_parent, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tmp_ckpt_", suffix=".pt", dir=out_parent or ".")
+    os.close(fd)
+    try:
+        torch.save(ckpt, tmp)
+        os.replace(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
 
 
 def main():
@@ -123,18 +145,20 @@ def main():
     if not args.smoke_test and not args.data:
         raise ValueError("--data is required unless --smoke_test is used")
 
+    resume_same_out = (args.resume is not None
+                       and Path(args.resume).resolve() == Path(args.out).resolve())
+    out_parent = Path(args.out).parent
+    if str(out_parent) not in ("", "."):
+        out_parent.mkdir(parents=True, exist_ok=True)
+    if Path(args.out).exists() and not args.allow_overwrite and not resume_same_out:
+        raise FileExistsError(
+            f"Refusing to overwrite {args.out}; use --allow_overwrite or a new --out.")
+
     torch.manual_seed(args.seed)
     if args.smoke_test or not torch.cuda.is_available():
         device = torch.device("cpu")
     else:
         device = torch.device("cuda")
-
-    out_parent = Path(args.out).parent
-    if str(out_parent) not in ("", "."):
-        out_parent.mkdir(parents=True, exist_ok=True)
-    if Path(args.out).exists() and not args.allow_overwrite:
-        raise FileExistsError(
-            f"Refusing to overwrite {args.out}; use --allow_overwrite or a new --out.")
 
     model = BitByteDEQ(
         vocab_size=256,
@@ -168,12 +192,35 @@ def main():
           f"solver={args.solver} max_iter={args.max_iter} tol={args.tol}")
     print(f"Optimizer: {'AdamW8bit' if use_bnb else 'torch AdamW'}  device={device}")
 
-    if args.smoke_test:
-        it = None
-    else:
+    start_step = 0
+    if args.resume:
+        try:
+            ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        except Exception as exc:
+            raise RuntimeError(f"Failed to load checkpoint {args.resume!r}") from exc
+        if ckpt.get("variant") not in (None, "deq"):
+            raise ValueError(
+                f"Checkpoint variant mismatch: expected 'deq', got {ckpt.get('variant')!r}")
+        model.load_state_dict(ckpt["model"])
+        if not args.no_opt_state:
+            if "opt" not in ckpt or "scaler" not in ckpt:
+                raise KeyError("Checkpoint missing optimizer/scaler state; use --no_opt_state.")
+            opt.load_state_dict(ckpt["opt"])
+            scaler.load_state_dict(ckpt["scaler"])
+        else:
+            print("[WARN] --no_opt_state: resuming model weights with fresh optimizer/scaler.")
+        start_step = int(ckpt.get("step", 0)) + 1
+        print(f"Resumed from {args.resume} at step {start_step}")
+
+    # Initial seq_len for dataset construction; updated each step for curriculum.
+    init_seq_len = args.seq_len or seq_len_for_step(0, args.steps, cap=args.seq_len_cap)
+
+    ds = None
+    it = None
+    if not args.smoke_test:
         ds = ByteShardDataset(
             shard_glob=os.path.join(args.data, "shard_*.bin"),
-            seq_len=args.seq_len, seed=args.seed, rank=0, world_size=1)
+            seq_len=init_seq_len, seed=args.seed, rank=0, world_size=1)
         it = iter(torch.utils.data.DataLoader(
             ds, batch_size=args.batch_size, num_workers=0, pin_memory=True))
 
@@ -183,7 +230,7 @@ def main():
             shard_glob=os.path.join(args.val_data, "shard_*.bin"),
             seq_len=args.val_seq_len, seed=5678, rank=0, world_size=1)
         val_dl = torch.utils.data.DataLoader(
-            val_ds, batch_size=1, num_workers=0, pin_memory=True)
+            val_ds, batch_size=args.batch_size, num_workers=0, pin_memory=True)
 
     warmup_steps = int(args.steps * args.warmup_frac)
     amp_enabled = device.type == "cuda" and not args.no_amp
@@ -192,7 +239,13 @@ def main():
 
     model.train()
     t0 = time.time()
-    for step in range(args.steps):
+    for step in range(start_step, args.steps):
+        seq_len = (args.seq_len
+                   if args.seq_len is not None
+                   else seq_len_for_step(step, args.steps, cap=args.seq_len_cap))
+        if ds is not None:
+            ds.set_seq_len(seq_len)
+
         for g in opt.param_groups:
             g["lr"] = lr_for_step(step, warmup_steps, args.steps, args.lr)
 
@@ -207,8 +260,8 @@ def main():
 
         for _ in range(args.grad_accum):
             if args.smoke_test:
-                x = torch.randint(0, 256, (args.batch_size, args.seq_len), device=device)
-                y = torch.randint(0, 256, (args.batch_size, args.seq_len), device=device)
+                x = torch.randint(0, 256, (args.batch_size, seq_len), device=device)
+                y = torch.randint(0, 256, (args.batch_size, seq_len), device=device)
             else:
                 x, y = next(it)
                 x = x.to(device, non_blocking=True)
@@ -256,18 +309,20 @@ def main():
             bpb = loss_avg / math.log(2.0)
             dt = time.time() - t0
             if reg_mode == "spec":
-                reg_str = f"sig {model.last_sigma:.3f}  reg {reg_sum / n:.3f}  "
+                reg_str = (f"sig_mean {model.last_sigma:.3f}  "
+                           f"sig_max {model.last_sigma_max:.3f}  "
+                           f"reg {reg_sum / n:.3f}  ")
             elif reg_mode == "jac":
                 reg_str = f"jac {reg_sum / n:.3f}  "
             else:
                 reg_str = ""
-            print(f"step {step:6d}  seq {args.seq_len:4d}  loss {loss_avg:.4f}  "
+            print(f"step {step:6d}  seq {seq_len:4d}  loss {loss_avg:.4f}  "
                   f"bpb {bpb:.4f}  {reg_str}fp_iters {iters_sum / n:.1f}  "
                   f"fp_res {res_sum / n:.2e}  fp_conv {conv_sum}/{n}  {dt:.1f}s")
             t0 = time.time()
 
         if (step % args.save_every == 0) and step > 0:
-            torch.save(
+            _save_atomic(
                 {"step": step, "variant": "deq", "model": model.state_dict(),
                  "opt": opt.state_dict(), "scaler": scaler.state_dict(),
                  "args": vars(args)},
@@ -275,9 +330,11 @@ def main():
             print(f"saved {args.out}")
 
         if args.val_every > 0 and (step % args.val_every == 0) and step > 0:
+            model.eval()
             res = run_ar_validation(
                 model, val_dl, device, max_batches=args.val_batches,
                 is_ddp=False, use_amp=amp_enabled)
+            model.train()
             print(f"val  step {step:6d}  loss {res.loss:.4f}  bpb {res.bits_per_byte:.4f}  "
                   f"ppl {res.perplexity:.2f}  tokens {res.num_tokens}")
 

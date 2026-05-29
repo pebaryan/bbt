@@ -146,7 +146,7 @@ class BitByteDEQ(nn.Module):
         n_prelude=2,
         n_core=1,
         n_coda=0,
-        quantize=True,
+        quantize=False,
         act_quant=True,
         rope_base=10000.0,
         use_sdpa=True,
@@ -187,6 +187,7 @@ class BitByteDEQ(nn.Module):
 
         self.last_info = {}
         self.last_sigma = float("nan")
+        self.last_sigma_max = float("nan")
 
     def _core(self, h):
         for blk in self.core:
@@ -263,6 +264,7 @@ class BitByteDEQ(nn.Module):
                     sigma = self._spectral_sigma(y_out, y_in, reg_iters)
                     reg_loss = (sigma - reg_margin).clamp_min(0).pow(2).mean()
                     self.last_sigma = float(sigma.mean().item())
+                    self.last_sigma_max = float(sigma.max().item())
                 else:
                     raise ValueError(f"unknown reg {reg!r}")
             y_star = y_out
