@@ -19,7 +19,7 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from data.byte_shard_dataset import ByteShardDataset
+from byte_shard_dataset import ByteShardDataset  # mmap-backed (efficient on large shards)
 from models.bitbyte_deq import BitByteDEQ
 from training.eval import run_ar_validation
 from training.lr_scheduler import lr_for_step, seq_len_for_step
@@ -44,11 +44,24 @@ def build_args():
 
     ap.add_argument("--solver", type=str, default="anderson", choices=["anderson", "fpi"])
     ap.add_argument("--max_iter", type=int, default=24)
-    ap.add_argument("--tol", type=float, default=1e-3)
+    ap.add_argument("--tol", type=float, default=None,
+                    help="Solver convergence tol. Default 1e-3 (fp) / 3e-3 (--quantize): "
+                         "ternary quantization gives a residual noise floor ~2-3e-3, below "
+                         "which the solver cannot converge, so a tighter tol false-alarms.")
     ap.add_argument("--solver_beta", type=float, default=1.0)
     ap.add_argument("--anderson_m", type=int, default=5)
     ap.add_argument("--layer_scale_init", type=float, default=0.1)
     ap.add_argument("--gamma_max", type=float, default=1.0)
+    ap.add_argument("--jac_reg", type=float, default=0.0,
+                    help="Frobenius Jacobian-reg weight (lambda * ||J_f||_F^2). 0 disables.")
+    ap.add_argument("--spec_reg", type=float, default=0.0,
+                    help="Spectral-norm reg weight: lambda * relu(sigma_max - margin)^2. 0 disables.")
+    ap.add_argument("--spec_margin", type=float, default=0.9,
+                    help="Contraction margin; penalize sigma_max above this.")
+    ap.add_argument("--spec_iters", type=int, default=3,
+                    help="Power-iteration steps for the sigma_max estimate.")
+    ap.add_argument("--reg_every", type=int, default=1,
+                    help="Apply the Jacobian/spectral penalty every N steps (amortizes cost).")
 
     ap.add_argument("--quantize", action="store_true",
                     help="Use BitNet ternary BitLinear instead of full-precision nn.Linear")
@@ -78,6 +91,12 @@ def build_args():
 
 def main():
     args = build_args()
+
+    if args.tol is None:
+        # Ternary quantization makes the fixed-point map slightly non-smooth,
+        # producing a residual noise floor ~2-3e-3; a tighter tol can never be
+        # reached and the solver reports false non-convergence.
+        args.tol = 3e-3 if args.quantize else 1e-3
 
     if args.smoke_test:
         args.steps = min(args.steps, 10)
@@ -165,6 +184,8 @@ def main():
 
     warmup_steps = int(args.steps * args.warmup_frac)
     amp_enabled = device.type == "cuda" and not args.no_amp
+    reg_mode = "spec" if args.spec_reg > 0 else ("jac" if args.jac_reg > 0 else None)
+    reg_lambda = args.spec_reg if reg_mode == "spec" else args.jac_reg
 
     model.train()
     t0 = time.time()
@@ -172,9 +193,11 @@ def main():
         for g in opt.param_groups:
             g["lr"] = lr_for_step(step, warmup_steps, args.steps, args.lr)
 
+        do_reg = reg_mode is not None and (step % args.reg_every == 0)
         opt.zero_grad(set_to_none=True)
         did_backward = False
         loss_sum = 0.0
+        reg_sum = 0.0
         iters_sum = 0
         res_sum = 0.0
         conv_sum = 0
@@ -191,8 +214,17 @@ def main():
             amp_ctx = (torch.amp.autocast("cuda", dtype=torch.float16)
                        if amp_enabled else nullcontext())
             with amp_ctx:
-                logits = model(x)
-                loss = F.cross_entropy(logits.view(-1, 256), y.view(-1)) / args.grad_accum
+                if do_reg:
+                    logits, reg_loss, _ = model(
+                        x, reg=reg_mode, reg_margin=args.spec_margin,
+                        reg_iters=args.spec_iters)
+                    ce = F.cross_entropy(logits.view(-1, 256), y.view(-1))
+                    loss = (ce + reg_lambda * reg_loss) / args.grad_accum
+                    reg_sum += float(reg_loss.item())
+                else:
+                    logits = model(x)
+                    ce = F.cross_entropy(logits.view(-1, 256), y.view(-1))
+                    loss = ce / args.grad_accum
 
             if not torch.isfinite(loss):
                 print(f"[WARN] non-finite loss at step {step}, skipping microbatch")
@@ -200,7 +232,7 @@ def main():
 
             scaler.scale(loss).backward()
             did_backward = True
-            loss_sum += float(loss.item()) * args.grad_accum
+            loss_sum += float(ce.item())
             info = model.last_info
             iters_sum += int(info.get("iters", 0))
             res_sum += float(info.get("rel_residual", 0.0))
@@ -220,8 +252,14 @@ def main():
             loss_avg = loss_sum / n
             bpb = loss_avg / math.log(2.0)
             dt = time.time() - t0
+            if reg_mode == "spec":
+                reg_str = f"sig {model.last_sigma:.3f}  reg {reg_sum / n:.3f}  "
+            elif reg_mode == "jac":
+                reg_str = f"jac {reg_sum / n:.3f}  "
+            else:
+                reg_str = ""
             print(f"step {step:6d}  seq {args.seq_len:4d}  loss {loss_avg:.4f}  "
-                  f"bpb {bpb:.4f}  fp_iters {iters_sum / n:.1f}  "
+                  f"bpb {bpb:.4f}  {reg_str}fp_iters {iters_sum / n:.1f}  "
                   f"fp_res {res_sum / n:.2e}  fp_conv {conv_sum}/{n}  {dt:.1f}s")
             t0 = time.time()
 

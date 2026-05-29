@@ -26,6 +26,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from quantization.bitlinear import BitLinear
 from .rmsnorm import RMSNorm
@@ -174,6 +175,7 @@ class BitByteDEQ(nn.Module):
         self.lm_head.weight = self.tok_emb.weight  # weight tying
 
         self.last_info = {}
+        self.last_sigma = float("nan")
 
     def _core(self, h):
         for blk in self.core:
@@ -190,7 +192,36 @@ class BitByteDEQ(nn.Module):
                         beta=self.solver_beta, m=self.anderson_m)
         return dict(max_iter=self.max_iter, tol=self.tol, beta=self.solver_beta)
 
-    def forward(self, idx, return_info=False):
+    @staticmethod
+    def _unit(v):
+        n = v.flatten(1).norm(dim=1).clamp_min(1e-12)
+        return v / n.reshape(-1, *([1] * (v.dim() - 1)))
+
+    def _vjp(self, y_out, y_in, u, create_graph=False):
+        (g,) = torch.autograd.grad(
+            y_out, y_in, grad_outputs=u,
+            create_graph=create_graph, retain_graph=True)
+        return g
+
+    def _jvp(self, y_out, y_in, v, create_graph=False):
+        # Jacobian-vector product J v via the double-vjp trick.
+        w = torch.zeros_like(y_out, requires_grad=True)
+        (jt_w,) = torch.autograd.grad(
+            y_out, y_in, grad_outputs=w, create_graph=True, retain_graph=True)
+        (jv,) = torch.autograd.grad(
+            jt_w, w, grad_outputs=v, create_graph=create_graph, retain_graph=True)
+        return jv
+
+    def _spectral_sigma(self, y_out, y_in, n_iters):
+        """Per-sample estimate of sigma_max(J_f) via power iteration on J^T J."""
+        v = self._unit(torch.randn_like(y_in))
+        for _ in range(max(0, n_iters - 1)):
+            jv = self._jvp(y_out, y_in, v)
+            v = self._unit(self._vjp(y_out, y_in, jv)).detach()
+        jv = self._jvp(y_out, y_in, v, create_graph=True)
+        return jv.flatten(1).norm(dim=1)  # [B], differentiable
+
+    def forward(self, idx, return_info=False, reg=None, reg_margin=0.9, reg_iters=2):
         c = self.tok_emb(idx)
         for blk in self.prelude:
             c = blk(c)
@@ -201,15 +232,39 @@ class BitByteDEQ(nn.Module):
             y_star, info = solver(lambda y: self._f(y, c_det), c_det, **self._solver_kwargs())
         self.last_info = info
 
-        # Jacobian-free (1-step) gradient: one application of f at the detached
-        # fixed point, using the grad-tracking context c.
-        y_star = self._f(y_star.detach(), c)
+        # Jacobian-free (1-step) gradient at the detached fixed point.
+        reg_loss = None
+        if reg and self.training:
+            # The math SDPA backend is required: efficient/flash backward kernels
+            # have no double-backward, which the vjp/jvp create_graph needs.
+            y_in = y_star.detach().requires_grad_(True)
+            with sdpa_kernel([SDPBackend.MATH]):
+                y_out = self._f(y_in, c)
+                if reg == "jac":
+                    # Hutchinson estimate of ||J_f||_F^2 (Bai et al. 2021).
+                    eps = torch.randn_like(y_out)
+                    vjp = self._vjp(y_out, y_in, eps, create_graph=True)
+                    reg_loss = vjp.pow(2).sum() / y_out.shape[0]
+                    self.last_sigma = float("nan")
+                elif reg == "spec":
+                    # Penalize the spectral norm above a contraction margin so
+                    # the fixed-point map stays a contraction (sigma_max < 1).
+                    sigma = self._spectral_sigma(y_out, y_in, reg_iters)
+                    reg_loss = (sigma - reg_margin).clamp_min(0).pow(2).mean()
+                    self.last_sigma = float(sigma.mean().item())
+                else:
+                    raise ValueError(f"unknown reg {reg!r}")
+            y_star = y_out
+        else:
+            y_star = self._f(y_star.detach(), c)
 
         h = y_star
         for blk in self.coda:
             h = blk(h)
         h = self.norm_f(h)
         logits = self.lm_head(h)
+        if reg:
+            return logits, reg_loss, info
         if return_info:
             return logits, info
         return logits
