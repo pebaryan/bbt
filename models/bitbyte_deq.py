@@ -41,27 +41,36 @@ def make_linear(in_f, out_f, *, quantize, act_quant, bias=False):
 
 
 class Attention(nn.Module):
-    def __init__(self, d_model, n_head, *, quantize, act_quant, rope_base, use_sdpa, causal=True):
+    def __init__(self, d_model, n_head, *, quantize, act_quant, rope_base, use_sdpa,
+                 causal=True, n_kv_head=None):
         super().__init__()
         assert d_model % n_head == 0
+        if n_kv_head is None:
+            n_kv_head = n_head
+        assert n_head % n_kv_head == 0, "n_head must be divisible by n_kv_head"
         self.n_head = n_head
+        self.n_kv_head = n_kv_head
+        self.n_rep = n_head // n_kv_head
         self.head_dim = d_model // n_head
         self.use_sdpa = use_sdpa
         self.causal = causal
         self.q_proj = make_linear(d_model, d_model, quantize=quantize, act_quant=act_quant)
-        self.k_proj = make_linear(d_model, d_model, quantize=quantize, act_quant=act_quant)
-        self.v_proj = make_linear(d_model, d_model, quantize=quantize, act_quant=act_quant)
+        self.k_proj = make_linear(d_model, n_kv_head * self.head_dim, quantize=quantize, act_quant=act_quant)
+        self.v_proj = make_linear(d_model, n_kv_head * self.head_dim, quantize=quantize, act_quant=act_quant)
         self.o_proj = make_linear(d_model, d_model, quantize=quantize, act_quant=act_quant)
         self.rope = RoPE(self.head_dim, base=rope_base)
 
     def forward(self, x):
         B, T, C = x.shape
         q = self.q_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.n_head, self.head_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, T, self.n_kv_head, self.head_dim).transpose(1, 2)
         pos = torch.arange(T, device=x.device)
         q = self.rope(q, pos)
         k = self.rope(k, pos)
+        if self.n_rep > 1:
+            k = k[:, :, None].expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_head, T, self.head_dim)
+            v = v[:, :, None].expand(-1, -1, self.n_rep, -1, -1).reshape(B, self.n_head, T, self.head_dim)
         if self.use_sdpa and hasattr(F, "scaled_dot_product_attention"):
             y = F.scaled_dot_product_attention(q, k, v, is_causal=self.causal)
         else:
@@ -94,12 +103,13 @@ class DEQBlock(nn.Module):
     """
 
     def __init__(self, d_model, n_head, d_ff, *, quantize, act_quant, rope_base,
-                 use_sdpa, causal=True, gated=False, layer_scale_init=0.1, gamma_max=1.0):
+                 use_sdpa, causal=True, n_kv_head=None, gated=False,
+                 layer_scale_init=0.1, gamma_max=1.0):
         super().__init__()
         self.n1 = RMSNorm(d_model)
         self.attn = Attention(
             d_model, n_head, quantize=quantize, act_quant=act_quant,
-            rope_base=rope_base, use_sdpa=use_sdpa, causal=causal)
+            rope_base=rope_base, use_sdpa=use_sdpa, causal=causal, n_kv_head=n_kv_head)
         self.n2 = RMSNorm(d_model)
         self.mlp = MLP(d_model, d_ff, quantize=quantize, act_quant=act_quant)
         if gated:
@@ -131,6 +141,7 @@ class BitByteDEQ(nn.Module):
         vocab_size=256,
         d_model=512,
         n_head=8,
+        n_kv_head=None,
         d_ff=1024,
         n_prelude=2,
         n_core=1,
@@ -158,7 +169,7 @@ class BitByteDEQ(nn.Module):
         nn.init.normal_(self.tok_emb.weight, mean=0.0, std=1.0 / math.sqrt(d_model))
 
         common = dict(quantize=quantize, act_quant=act_quant, rope_base=rope_base,
-                      use_sdpa=use_sdpa, causal=True)
+                      use_sdpa=use_sdpa, causal=True, n_kv_head=n_kv_head)
         self.prelude = nn.ModuleList(
             DEQBlock(d_model, n_head, d_ff, gated=False, **common)
             for _ in range(n_prelude))

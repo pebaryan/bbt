@@ -74,7 +74,7 @@ def anderson_solve(f, x0, *, max_iter=50, tol=1e-3, m=5, beta=1.0, lam=1e-4, min
             + (1 - beta) * (alpha[:, None] @ X[:, :n])[:, 0]
         )
         Fm[:, idx] = f(X[:, idx].reshape_as(x0)).reshape(bsz, -1)
-        res = (Fm[:, idx] - X[:, idx]).norm().item() / (1e-5 + Fm[:, idx].norm().item())
+        res = _rel_residual(Fm[:, idx], X[:, idx])
         if it >= min_iter and res < tol:
             break
 

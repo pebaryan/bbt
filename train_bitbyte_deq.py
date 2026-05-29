@@ -37,6 +37,8 @@ def build_args():
 
     ap.add_argument("--d_model", type=int, default=512)
     ap.add_argument("--n_head", type=int, default=8)
+    ap.add_argument("--n_kv_head", type=int, default=None,
+                    help="KV heads for GQA. None = MHA (n_head).")
     ap.add_argument("--d_ff", type=int, default=1024)
     ap.add_argument("--n_prelude", type=int, default=2)
     ap.add_argument("--n_core", type=int, default=1)
@@ -138,6 +140,7 @@ def main():
         vocab_size=256,
         d_model=args.d_model,
         n_head=args.n_head,
+        n_kv_head=args.n_kv_head,
         d_ff=args.d_ff,
         n_prelude=args.n_prelude,
         n_core=args.n_core,
