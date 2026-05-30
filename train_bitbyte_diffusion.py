@@ -106,7 +106,7 @@ def maybe_resume(
     else:
         model.load_state_dict(state)
 
-    if not args.no_opt_state:
+    if not args.no_opt_state and "opt" in ckpt:
         optimizer.load_state_dict(ckpt["opt"])
         scaler.load_state_dict(ckpt["scaler"])
     elif rank == 0:
@@ -153,6 +153,17 @@ def main() -> None:
         "--no_bnb",
         action="store_true",
         help="Disable bitsandbytes AdamW8bit and use torch AdamW instead",
+    )
+    ap.add_argument(
+        "--galore",
+        action="store_true",
+        help="Use GaLore memory-efficient optimizer (projects gradients to low-rank)",
+    )
+    ap.add_argument(
+        "--galore_rank",
+        type=int,
+        default=128,
+        help="GaLore projection rank (default 128)",
     )
 
     ap.add_argument("--lr", type=float, default=2e-4)
@@ -363,6 +374,8 @@ def main() -> None:
         betas=(0.9, 0.95),
         weight_decay=args.wd,
         use_bnb=(device.type == "cuda" and not args.no_bnb),
+        use_galore=args.galore,
+        galore_rank=args.galore_rank,
     )
     scaler = create_grad_scaler()
 
@@ -581,10 +594,11 @@ def main() -> None:
                 "step": step,
                 "variant": "diffusion",
                 "model": (model.module.state_dict() if is_ddp else model.state_dict()),
-                "opt": opt.state_dict(),
-                "scaler": scaler.state_dict(),
                 "args": vars(args),
             }
+            if not args.no_opt_state:
+                ckpt["opt"] = opt.state_dict()
+                ckpt["scaler"] = scaler.state_dict()
             torch.save(ckpt, args.out)
             print(f"saved {args.out} (pn {save_param_norm:.2e})")
 
