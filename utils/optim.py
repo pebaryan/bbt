@@ -5,7 +5,7 @@ import torch.nn as nn
 def _get_galore_param_groups(
     model: torch.nn.Module,
     rank: int = 128,
-    update_proj_gap: int = 50,
+    update_proj_gap: int = 200,
     scale: float = 1.0,
     proj_type: str = "std",
 ) -> list[dict]:
