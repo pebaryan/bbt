@@ -14,11 +14,12 @@ def _get_galore_param_groups(
     GaLore is applied to linear projections in attention and MLP layers.
     All other parameters (embeddings, norms, biases, lm_head) use regular AdamW.
     """
-    from galore_torch import GaLoreAdamW
-
     galore_params = []
+    # LLaMA-style names kept for compatibility; our SwiGLU MLP uses
+    # "gate_up" (fused gate+up) and "down" instead of gate_proj/up_proj/down_proj.
     target_modules = ["q_proj", "k_proj", "v_proj", "o_proj",
-                       "gate_proj", "up_proj", "down_proj"]
+                       "gate_proj", "up_proj", "down_proj",
+                       "gate_up", "mlp.down"]
 
     for module_name, module in model.named_modules():
         if not hasattr(module, "weight"):

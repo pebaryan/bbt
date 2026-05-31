@@ -57,6 +57,10 @@ def build_args():
     ap.add_argument("--no_sdpa", action="store_true")
     ap.add_argument("--no_bnb", action="store_true")
     ap.add_argument("--no_amp", action="store_true")
+    ap.add_argument("--galore", action="store_true",
+                    help="Use GaLore memory-efficient optimizer (requires galore-torch)")
+    ap.add_argument("--galore_rank", type=int, default=128,
+                    help="GaLore projection rank")
 
     # Training — defaults match DEQ.
     ap.add_argument("--lr", type=float, default=6e-4)
@@ -142,7 +146,8 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     opt, use_bnb = create_optimizer(
         model, lr=args.lr, betas=(0.9, 0.95), weight_decay=args.wd,
-        use_bnb=(device.type == "cuda" and not args.no_bnb))
+        use_bnb=(device.type == "cuda" and not args.no_bnb),
+        use_galore=args.galore, galore_rank=args.galore_rank)
     scaler = create_grad_scaler()
 
     print(f"BitByteLM (AR baseline)  params={n_params/1e6:.2f}M  "

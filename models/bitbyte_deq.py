@@ -28,6 +28,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from quantization.bitlinear import BitLinear
 from .rmsnorm import RMSNorm
 from .rope import RoPE
@@ -104,8 +105,9 @@ class DEQBlock(nn.Module):
 
     def __init__(self, d_model, n_head, d_ff, *, quantize, act_quant, rope_base,
                  use_sdpa, causal=True, n_kv_head=None, gated=False,
-                 layer_scale_init=0.1, gamma_max=1.0):
+                 layer_scale_init=0.1, gamma_max=1.0, ckpt=False):
         super().__init__()
+        self.ckpt = ckpt
         self.n1 = RMSNorm(d_model)
         self.attn = Attention(
             d_model, n_head, quantize=quantize, act_quant=act_quant,
@@ -123,7 +125,7 @@ class DEQBlock(nn.Module):
             self.register_parameter("raw_gamma_mlp", None)
             self.gamma_max = 1.0
 
-    def forward(self, x):
+    def _forward_body(self, x):
         a = self.attn(self.n1(x))
         if self.raw_gamma_attn is not None:
             a = a * (torch.sigmoid(self.raw_gamma_attn) * self.gamma_max)
@@ -131,8 +133,12 @@ class DEQBlock(nn.Module):
         m = self.mlp(self.n2(x))
         if self.raw_gamma_mlp is not None:
             m = m * (torch.sigmoid(self.raw_gamma_mlp) * self.gamma_max)
-        x = x + m
-        return x
+        return x + m
+
+    def forward(self, x):
+        if self.ckpt and self.training:
+            return grad_ckpt(self._forward_body, x, use_reentrant=False)
+        return self._forward_body(x)
 
 
 class BitByteDEQ(nn.Module):
@@ -152,16 +158,18 @@ class BitByteDEQ(nn.Module):
         use_sdpa=True,
         solver="anderson",
         max_iter=24,
-        tol=1e-3,
+        tol=None,
         solver_beta=1.0,
         anderson_m=5,
         layer_scale_init=0.1,
         gamma_max=1.0,
+        ckpt=True,
     ):
         super().__init__()
         self.solver_name = solver
         self.max_iter = max_iter
-        self.tol = tol
+        # Auto-select tol based on quantize if not specified explicitly.
+        self.tol = tol if tol is not None else (3e-3 if quantize else 1e-3)
         self.solver_beta = solver_beta
         self.anderson_m = anderson_m
 
@@ -170,15 +178,16 @@ class BitByteDEQ(nn.Module):
 
         common = dict(quantize=quantize, act_quant=act_quant, rope_base=rope_base,
                       use_sdpa=use_sdpa, causal=True, n_kv_head=n_kv_head)
+        # Prelude/coda support grad-ckpt; core runs under no_grad so ckpt has no effect there.
         self.prelude = nn.ModuleList(
-            DEQBlock(d_model, n_head, d_ff, gated=False, **common)
+            DEQBlock(d_model, n_head, d_ff, gated=False, ckpt=ckpt, **common)
             for _ in range(n_prelude))
         self.core = nn.ModuleList(
             DEQBlock(d_model, n_head, d_ff, gated=True,
                      layer_scale_init=layer_scale_init, gamma_max=gamma_max, **common)
             for _ in range(n_core))
         self.coda = nn.ModuleList(
-            DEQBlock(d_model, n_head, d_ff, gated=False, **common)
+            DEQBlock(d_model, n_head, d_ff, gated=False, ckpt=ckpt, **common)
             for _ in range(n_coda))
 
         self.norm_f = RMSNorm(d_model)
