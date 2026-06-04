@@ -6,6 +6,7 @@ sys.path.insert(0, '/home/peb/code/bbt')
 import torch
 import torch.nn.functional as F
 from experiments.train_2L_blockwise import GA_Blockwise, Vanilla_Blockwise
+from experiments.train_ar_ce_baseline import AR_Transformer
 
 DEVICE = 'cuda'
 SEQ_LEN = 512
@@ -28,18 +29,24 @@ ckpts = [
      {'n_layer': 16, 'd_model': 768, 'n_head': 8, 'd_ff': 2048, 'mv_dim': 8}),
     ('Vanilla 16L (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_vanilla.pt', Vanilla_Blockwise,
      {'n_layer': 16, 'd_model': 768, 'n_head': 8, 'd_ff': 2048}),
+    # External baseline
+    ('AR CE baseline 2L', '/home/peb/data/bbt_checkpoints/ce_baseline_ar_2L_128d.pt', AR_Transformer,
+     {'n_layer': 2, 'd_model': 128, 'n_head': 4, 'd_ff': 256}),
 ]
 
 @torch.no_grad()
-def sliding_ppl(model, data, seq_len=SEQ_LEN, stride=STRIDE):
+def sliding_ppl(model, data, seq_len=SEQ_LEN, stride=STRIDE, is_ar=False):
     """Compute perplexity using sliding window (like GPT-2 eval)."""
     model.eval()
     nll = 0.0
     n_tokens = 0
     for i in range(0, len(data) - seq_len, stride):
         x = data[i:i+seq_len].unsqueeze(0).to(DEVICE)
-        t = torch.zeros(1, dtype=torch.long, device=DEVICE)
-        logits = model(x, t, is_causal=True)
+        if is_ar:
+            logits = model(x)
+        else:
+            t = torch.zeros(1, dtype=torch.long, device=DEVICE)
+            logits = model(x, t, is_causal=True)
         loss = F.cross_entropy(logits[0, :-1], x[0, 1:])
         n_tokens += seq_len - 1
         nll += loss.item() * (seq_len - 1)
@@ -57,11 +64,14 @@ for name, ckpt_path, ModelClass, model_args in ckpts:
     
     if ModelClass is GA_Blockwise:
         model = ModelClass(**model_args).to(DEVICE)
+    elif ModelClass is AR_Transformer:
+        model = ModelClass(**model_args).to(DEVICE)
     else:
         model = ModelClass(**model_args).to(DEVICE)
     
     model.load_state_dict(raw['model'])
     model.eval()
     
-    ppl, bpb = sliding_ppl(model, data)
+    is_ar = ModelClass is AR_Transformer
+    ppl, bpb = sliding_ppl(model, data, is_ar=is_ar)
     print(f"  {name}:  PPL={ppl:.2f}  BPB={bpb:.4f}")
