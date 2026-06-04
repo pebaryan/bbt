@@ -45,21 +45,23 @@ GA models converge **faster** than vanilla in early training at 2L scale:
 
 The initial advantage is large (0.16 nats) and narrows to a persistent 0.03–0.04 nat gap at convergence. The GA bottleneck acts as a **learned regularizer** that structures the embedding space during early training.
 
-**Caveat: dimension scaling and model scale interact.** The GA dim=16 advantage (11% PPL over vanilla, 3% over AR baseline) was evaluated at 2L/128d scale. At 16L/768d with dim=8, GA and vanilla are essentially tied on clean CE with vanilla producing qualitatively better samples. The 16L GA dim=16 variant is currently being trained — this will determine whether the advantage generalizes or whether the optimal GA dimension must scale with model capacity.
+**Caveat: dimension scaling and model scale interact.** The GA dim=16 advantage was evaluated at both 2L/128d and 16L/768d scale. At 2L, GA dim=16 achieves 11% lower PPL than vanilla. At 16L with dim=8, the advantage vanished — but **GA dim=16 at 16L restores a 4.4% advantage** (PPL 2.17 vs 2.27). This confirms that the optimal GA dimension scales with model capacity: the dim=8 bottleneck at 16L is analogous to the dim=4 bottleneck at 2L.
 
 ## Blockwise Training at 16L Scale — Controlled Comparison
 
 At 114M parameters with AMP enabled for both variants, the comparison is clean:
 
-| Metric | GA 16L (AMP) | Vanilla 16L (AMP) | Δ |
-|--------|-------------|-------------------|----|
-| Final Clean CE | 1.260 | **1.221** | +0.039 |
-| Best Clean CE | **0.919** | 0.940 | **−0.021** |
-| Final Block CE | **0.892** | 2.033 | **−1.141** |
-| Best Block CE | **0.892** | 0.971 | **−0.079** |
-| **Test PPL** | **2.38** | **2.27** | +0.11 |
+| Metric | GA 16L (AMP, dim=8) | GA 16L (AMP, dim=16) | Vanilla 16L (AMP) | Δ (GA dim=16 vs vanilla) |
+|--------|---------------------|---------------------|-------------------|-------------------------|
+| Final Clean CE | 1.260 | **1.172** | 1.221 | **−0.049** |
+| Best Clean CE | 0.919 | **0.829** | 0.940 | **−0.111** |
+| Final Block CE | 0.892 | 1.353 | 2.033 | −0.680 |
+| Best Block CE | 0.892 | **0.954** | 0.971 | −0.017 |
+| **Test PPL** | 2.38 | **2.17** | 2.27 | **−4.4% 🏆** |
 
-The final clean CE slightly favors vanilla (1.221 vs 1.260), but GA achieves a lower best clean CE (0.919 vs 0.940) and massively outperforms on the block diffusion reconstruction task (0.892 vs 2.033 final block CE). The block CE gap suggests that GA's cosine-similarity decoder provides a better structured space for recovering masked tokens from context — the decoder can "steer" toward the correct byte's multivector by orientation rather than relying on a linear projection.
+**GA dim=16 restores the advantage.** At 2L scale, GA dim=16 beat vanilla by 11%. At 16L scale with dim=8, the advantage vanished (PPL 2.38 vs 2.27). Increasing to dim=16 recovers and even surpasses the advantage: **PPL 2.17 vs 2.27** (−4.4%). The GA dimension must scale with model capacity — dim=8 was a bottleneck at 16L just as dim=4 was at 2L.
+
+The improvement spans all metrics: best clean CE improves from 0.940 (vanilla) to 0.829 (GA dim=16), a 12% reduction. The block CE comparison is less clean since GA dim=16 converged to a slightly higher final Block CE than dim=8 (1.35 vs 0.89), but both massively outperform vanilla (2.03).
 
 When compared to the earlier GA 16L run without AMP (final clean CE 1.324), AMP provides a 5% improvement (1.260 vs 1.324), consistent with the benefits of mixed-precision training for this model scale.
 
@@ -134,7 +136,7 @@ This is a known limitation of small diffusion models: the conditional distributi
 
 ## Key Findings
 
-1. **GA embeddings match or exceed standard embeddings** at equal or fewer parameters for most metrics. At 2L scale, GA dim=16 achieves 11% lower PPL. At 16L scale, GA ties vanilla on clean CE (each wins on one variant of the metric) and **massively outperforms on the block diffusion task** (0.89 vs 2.03 final block CE).
+1. **GA embeddings match or exceed standard embeddings** at equal or fewer parameters across all metrics. At 2L scale, GA dim=16 achieves 11% lower PPL than vanilla and 3% lower than a pure AR baseline. At 16L scale, GA dim=16 achieves **4.4% lower PPL** than vanilla (2.17 vs 2.27), confirming the advantage scales with model capacity when the GA dimension is adequate.
 
 2. **GA dimension is critical.** dim=4 underperforms, dim=8 matches vanilla, dim=16 wins. The optimal lies between 8 and 16 for byte-level tasks.
 
@@ -152,7 +154,7 @@ This work investigated Geometric Algebra embeddings as a drop-in replacement for
 
 **The strongest result is at small scale.** GA dim=16 at 2L achieves 2.70 PPL vs vanilla's 3.06 — an 11% improvement — and notably beats a pure causal CE transformer with the same architecture (2.70 vs 2.78). This means the blockwise diffusion objective, which *hurts* vanilla performance (3.06 vs 2.78), actually *helps* GA performance when the structured embedding space provides a complementary learning signal. The result is robust across seeds (2.71 ± 0.01 PPL). The structured Cl(3,0) space regularizes the embedding layer effectively when model capacity is constrained.
 
-**At larger scale, the picture is more nuanced.** With 114M parameters, GA (dim=8) and vanilla produce nearly identical test PPL (2.38 vs 2.27), but GA dominates the block diffusion reconstruction task (0.89 vs 2.03 block CE) and achieves a lower best training loss. However, vanilla produces qualitatively better autoregressive samples. The key open question — whether GA dim=16 would restore the advantage at 16L scale — is currently being tested.
+**At larger scale, the GA advantage scales with dimension.** At 16L/768d with dim=8, GA and vanilla were tied. Increasing to GA dim=16 **restores a 4.4% PPL advantage** (2.17 vs 2.27) and achieves the best overall clean CE of any 16L model (0.829 vs vanilla's 0.940). This resolves the key open question: the GA dimension must scale with model capacity. The dim=8 bottleneck at 16L mirrors the dim=4 bottleneck at 2L — and in both cases, doubling to dim=16 unlocks the advantage. However, vanilla still produces qualitatively better autoregressive samples at this scale, suggesting that loss improvements don't directly translate to generation quality.
 
 **For the galbook thesis**, these results support two claims:
 1. **GA embeddings are a viable architectural primitive** — they match or beat standard embeddings at no cost to training stability or throughput
@@ -160,6 +162,6 @@ This work investigated Geometric Algebra embeddings as a drop-in replacement for
 
 The blockwise training objective similarly proved more useful as a regularized training signal than as an inference-time sampling strategy. The iterative refinement experiments were negative: the model's conditional distributions are too sharp to benefit from block-level reconstruction at inference.
 
-**Limitations.** Experiments are single-seed per variant (except GA dim=16 with 2 seeds). The 16L GA dim=16 variant is currently being trained. No external baselines (MDLM, BLT) were compared on the same data.
+**Limitations.** Experiments are single-seed per variant (except GA dim=16 with 2 seeds at 2L scale). No external baselines (MDLM, BLT) were compared on the same data. Sample quality at 16L still favors vanilla despite GA's PPL advantage — the gap between loss and generation quality is not fully understood.
 
-**Future work.** The immediate next step is to test GA dim=16 at 16L scale — this would resolve the open question and determine whether the 2L result generalizes. Scaling to 1B+ tokens on the 16L models would determine whether the GA-vanilla gap widens or narrows with sufficient data — the most practically important question for the thesis.
+**Future work.** The key remaining question is whether the GA-vanilla gap widens with sufficient data — scaling to 1B+ tokens on the 16L models would determine this. A deeper exploration of GA dimension scaling (dim=24, dim=32 at 16L) could reveal whether the dim=16 choice is optimal or if further gains are available. Finally, understanding the gap between PPL and generation quality merits investigation.
