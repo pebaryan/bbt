@@ -38,8 +38,10 @@ runs_2L = [
 ]
 
 runs_16L = [
-    ('GA 16L (no AMP)', '/tmp/ga_blockwise.log', '#2ecc71', ':', ''),
-    ('GA 16L (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_ga.log', '#27ae60', '--', ''),
+    ('GA dim=8 (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_ga.log', '#27ae60', '--', ''),
+    ('GA dim=16 (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_ga_dim16.log', '#1b9e4e', '-', ''),
+    ('GA dim=24 (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_ga_dim24.log', '#f39c12', '-', ''),
+    ('GA dim=32 (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_ga_dim32.log', '#e67e22', '-', ''),
     ('Vanilla 16L (AMP)', '/home/peb/data/bbt_checkpoints/blockwise_16L_vanilla.log', '#3498db', '--', ''),
 ]
 
@@ -94,8 +96,8 @@ ax.set_xlabel('Step'); ax.set_ylabel('Block CE (nats)')
 ax.legend(fontsize=8); ax.grid(alpha=0.3)
 
 plt.tight_layout()
-plt.savefig('/home/peb/data/bbt_checkpoints/loss_comparison.png', dpi=150)
-print("Saved loss_comparison.png")
+plt.savefig('/home/peb/code/bbt/figures/loss_comparison.png', dpi=150)
+print("Saved loss_comparison.png to figures/")
 
 # ── Also print a summary table ──────────────────────────────────────────────
 print("\n" + "="*80)
