@@ -30,7 +30,9 @@ class MambaMLM(nn.Module):
         time_step_min: float = 1e-3,
         time_step_max: float = 1e-1,
         dt_init: str = "log_uniform",
-        a_init: str = "uniform_0_16",
+        a_init: str = "log_arange",
+        ssm_type: str = "mamba",
+        num_levels: int = 9,
     ):
         """Initialize MambaMLM.
 
@@ -62,6 +64,8 @@ class MambaMLM(nn.Module):
                     d_state=d_state,
                     d_conv=d_conv,
                     expand=expand,
+                    ssm_type=ssm_type,
+                    num_levels=num_levels,
                     act_quant=act_quant,
                     use_checkpoint=use_checkpoint,
                     time_step_min=time_step_min,

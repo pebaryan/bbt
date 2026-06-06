@@ -30,6 +30,8 @@ def create_model(args: argparse.Namespace, device: torch.device) -> MambaMLM:
         time_step_max=args.time_step_max,
         dt_init=args.dt_init,
         a_init=args.a_init,
+        ssm_type=args.ssm_type,
+        num_levels=args.num_levels,
     ).to(device)
     return model
 
@@ -78,6 +80,19 @@ def main() -> None:
     ap.add_argument("--d_conv", type=int, default=4)
     ap.add_argument("--expand", type=int, default=2)
     ap.add_argument(
+        "--ssm_type",
+        type=str,
+        default="mamba",
+        choices=["mamba", "loglinear"],
+        help="SSM variant: 'mamba' (standard) or 'loglinear' (Fenwick multi-scale)",
+    )
+    ap.add_argument(
+        "--num_levels",
+        type=int,
+        default=9,
+        help="Number of Fenwick levels for loglinear SSM (default 9 ~ log2(512))",
+    )
+    ap.add_argument(
         "--time_step_min",
         type=float,
         default=1e-3,
@@ -99,9 +114,9 @@ def main() -> None:
     ap.add_argument(
         "--a_init",
         type=str,
-        default="uniform_0_16",
-        choices=["uniform_0_16", "log_arange"],
-        help="Initialization for Mamba A_log parameter",
+        default="log_arange",
+        choices=["log_arange", "uniform_0_16"],
+        help="Initialization for Mamba A_log parameter (log_arange matches original Mamba)",
     )
 
     ap.add_argument("--ddp", action="store_true", help="Enable DDP (requires torchrun)")

@@ -155,7 +155,9 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
     OUT = f'/home/peb/data/bbt_checkpoints/blockwise_{n_layer}L{suffix}.pt'
     LOG = OUT.replace('.pt', '.log')
     diffusion_steps = 64
-    log_every = max(200, min(2000, steps // 75))  # ~75 logs per run
+    # Patched 2026-06-05: log every 100 steps by default so progress is visible
+    # between long step counts (was: max(200, min(2000, steps//75)) ≈ 813 for 61k steps).
+    log_every = 100
     save_every = max(2000, steps // 3)
 
     device = torch.device('cuda')
@@ -272,11 +274,16 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
                 'step': step, 'model': model.state_dict(),
                 'variant': variant, 'args': {'n_layer': n_layer, 'd_model': d_model,
                                             'n_head': n_head, 'd_ff': d_ff},
+                'mv_dim': mv_dim,  # Patched 2026-06-05: so eval_one_ckpt can recover GA dim
                 'loss_clean': float(loss_clean.detach().cpu()),
                 'block_ce': float(avg_block.detach().cpu()),
                 'tokens_seen': step * batch_size * grad_accum * seq_len,
             }, OUT)
-            print(f"  saved {OUT}")
+            print(f"  saved {OUT}", flush=True)
+            if args.eval_on_save:
+                import subprocess
+                import sys as _sys
+                subprocess.run([_sys.executable, '/home/peb/code/bbt/eval_one_ckpt.py', OUT], check=False)
 
     total_time = time.time() - t_start
     print(f"\nDone. {total_time:.0f}s = {total_time/60:.1f}min. Final: {OUT}")
@@ -300,6 +307,8 @@ if __name__ == '__main__':
     ap.add_argument('--block-weight', type=float, default=0.5)
     ap.add_argument('--mv-dim', type=int, default=8, help='GA multivector dimension (GA variant only)')
     ap.add_argument('--seed', type=int, default=1234, help='RNG seed for data ordering')
+    ap.add_argument('--eval-on-save', action='store_true',
+                    help='Run eval_one_ckpt.py after every checkpoint save (adds ~30s per save)')
     args = ap.parse_args()
     train(
         variant=args.variant,

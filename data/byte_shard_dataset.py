@@ -56,8 +56,8 @@ class ByteShardDataset(torch.utils.data.IterableDataset):
         g = torch.Generator()
         g.manual_seed(self.seed + self.rank)
 
-        # Create deterministic shard order per rank
-        shard_order = list(range(self.total_shards))
+        # Cache shard contents in memory so we don't re-read the file per sample
+        shard_cache: dict[str, bytes] = {}
         
         # infinite stream
         i = self.rank
@@ -67,8 +67,10 @@ class ByteShardDataset(torch.utils.data.IterableDataset):
             # Select shard (round-robin across ranks)
             current_shard = self.shards[shard_idx % self.total_shards]
             
-            with open(current_shard, "rb") as f:
-                data = f.read()
+            if current_shard not in shard_cache:
+                with open(current_shard, "rb") as f:
+                    shard_cache[current_shard] = f.read()
+            data = shard_cache[current_shard]
             
             n = len(data)
             

@@ -30,7 +30,8 @@ class MambaSSM(nn.Module):
         time_step_min: float = 1e-3,
         time_step_max: float = 1e-1,
         dt_init: str = "log_uniform",
-        a_init: str = "uniform_0_16",
+        a_init: str = "log_arange",
+        **kwargs,  # ignores unused params (e.g. num_levels for loglinear compat)
     ):
         """Initialize Mamba SSM.
 
@@ -44,7 +45,7 @@ class MambaSSM(nn.Module):
             time_step_min: Minimum initial dt value for delta softplus bias
             time_step_max: Maximum initial dt value for delta softplus bias
             dt_init: Initialization for delta bias ("log_uniform" or "zeros")
-            a_init: Initialization for A_log ("uniform_0_16" or "log_arange")
+            a_init: Initialization for A_log ("log_arange" or "uniform_0_16")
         """
         super().__init__()
         if time_step_min <= 0 or time_step_max <= 0:
@@ -78,8 +79,9 @@ class MambaSSM(nn.Module):
         )
 
         # Selective delta projection (per-channel step size)
+        # From the convolved hidden state (official Mamba: dt is projected from post-conv x)
         self.delta_proj = BitLinear(
-            d_model, self.d_inner, bias=True, act_quant=act_quant
+            self.d_inner, self.d_inner, bias=True, act_quant=act_quant
         )
         self._init_dt_bias(
             bias=self.delta_proj.bias,
@@ -89,9 +91,9 @@ class MambaSSM(nn.Module):
             dt_init=dt_init,
         )
 
-        # Input-dependent B/C projections into state space
-        self.B_proj = BitLinear(d_model, self.d_state, bias=False, act_quant=act_quant)
-        self.C_proj = BitLinear(d_model, self.d_state, bias=False, act_quant=act_quant)
+        # Input-dependent B/C projections into state space (from convolved x)
+        self.B_proj = BitLinear(self.d_inner, self.d_state, bias=False, act_quant=act_quant)
+        self.C_proj = BitLinear(self.d_inner, self.d_state, bias=False, act_quant=act_quant)
 
         # Output projection
         self.out_proj = BitLinear(
@@ -111,6 +113,9 @@ class MambaSSM(nn.Module):
 
         # D parameter (direct connection)
         self.D = nn.Parameter(torch.ones(self.d_inner))
+
+        # Activation (SiLU/swish)
+        self.act = nn.SiLU()
 
     @staticmethod
     def _inv_softplus(x: torch.Tensor) -> torch.Tensor:
@@ -168,7 +173,11 @@ class MambaSSM(nn.Module):
         return y_ssm + D.view(1, 1, -1) * x_input
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass.
+        """Forward pass (fixes gate ordering to match official Mamba).
+
+        Official Mamba: split in_proj into x_for_ssm and z_gate.
+        x_for_ssm -> conv1d -> silu -> SSM
+        z_gate -> silu -> multiply SSM output -> out_proj
 
         Args:
             x: Input [B, L, d_model]
@@ -181,21 +190,20 @@ class MambaSSM(nn.Module):
         # Project to inner dimension
         x_projected = self.in_proj(x)  # [B, L, 2*d_inner]
 
-        # Split for gate and input
-        x_gate, x_input = x_projected.chunk(2, dim=-1)
-        x_input = F.silu(x_gate) * x_input  # [B, L, d_inner]
+        # Split into SSM input and gate (official Mamba ordering)
+        x_inner, z = x_projected.chunk(2, dim=-1)
 
-        # Convolution (local processing)
-        x_conv = self.conv1d(x_input.transpose(1, 2).contiguous())  # [B, d_inner, L]
+        # Convolution on the SSM input (local processing)
+        x_conv = self.conv1d(x_inner.transpose(1, 2).contiguous())  # [B, d_inner, L]
         x_conv = x_conv[:, :, :L].contiguous()  # Trim padding
-        x_input = x_conv.transpose(1, 2).contiguous()  # [B, L, d_inner]
+        x_inner = self.act(x_conv.transpose(1, 2).contiguous())  # [B, L, d_inner]
 
-        # Selective delta (per-channel step size)
-        delta = F.softplus(self.delta_proj(x))  # [B, L, d_inner]
+        # Selective delta (per-channel step size) — from convolved x_inner
+        delta = F.softplus(self.delta_proj(x_inner))  # [B, L, d_inner]
 
-        # Input-dependent B/C in state space (from original x)
-        B_matrix = self.B_proj(x.reshape(B * L, -1)).reshape(B, L, self.d_state)
-        C_matrix = self.C_proj(x.reshape(B * L, -1)).reshape(B, L, self.d_state)
+        # Input-dependent B/C in state space (from convolved x_inner)
+        B_matrix = self.B_proj(x_inner.reshape(B * L, -1)).reshape(B, L, self.d_state)
+        C_matrix = self.C_proj(x_inner.reshape(B * L, -1)).reshape(B, L, self.d_state)
 
         # A matrix: exp(A_log) for negative A (stability)
         A = -torch.exp(self.A_log.float())  # [d_inner, d_state]
@@ -204,7 +212,7 @@ class MambaSSM(nn.Module):
         if self.use_checkpoint and self.training:
             y_inner = checkpoint(
                 self._ssm_scan,
-                x_input,
+                x_inner,
                 delta,
                 B_matrix,
                 C_matrix,
@@ -213,9 +221,12 @@ class MambaSSM(nn.Module):
                 use_reentrant=False,
             )
         else:
-            y_inner = self._ssm_scan(x_input, delta, B_matrix, C_matrix, A, self.D)
+            y_inner = self._ssm_scan(x_inner, delta, B_matrix, C_matrix, A, self.D)
+
+        # Gate the SSM output: y = SSM_out * silu(z)
+        y_gated = y_inner * F.silu(z)
 
         # Output projection
-        y = self.out_proj(y_inner)  # [B, L, d_model]
+        y = self.out_proj(y_gated)  # [B, L, d_model]
 
         return y

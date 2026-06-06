@@ -11,6 +11,15 @@ __pycache__/
 
 # Local artifacts (datasets, checkpoints, logs, plots)
 artifacts/
+ckpt*.pt
+ckft*.pt
+*.pt
+data/*/
+combined_shards/
+TinyStories_shards/
+wiki103_shards/
+distill_shards*/
+fineweb_shards/
 
 # OS/editor noise
 .DS_Store
