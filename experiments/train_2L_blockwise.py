@@ -146,7 +146,8 @@ class Vanilla_Blockwise(nn.Module):
 
 def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
           steps=15000, batch_size=64, grad_accum=2, seq_len=512, lr=3e-4,
-          block_size=8, num_blocks=2, block_weight=0.5, mv_dim=8, seed=1234):
+          block_size=8, num_blocks=2, block_weight=0.5, mv_dim=8, seed=1234,
+          resume=None, eval_on_save=False):
     suffix = f"_{variant}"
     if variant == 'ga' and mv_dim != 8:
         suffix += f"_dim{mv_dim}"
@@ -155,15 +156,12 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
     OUT = f'/home/peb/data/bbt_checkpoints/blockwise_{n_layer}L{suffix}.pt'
     LOG = OUT.replace('.pt', '.log')
     diffusion_steps = 64
-    # Patched 2026-06-05: log every 100 steps by default so progress is visible
-    # between long step counts (was: max(200, min(2000, steps//75)) ≈ 813 for 61k steps).
     log_every = 100
     save_every = max(2000, steps // 3)
 
     device = torch.device('cuda')
     torch.backends.cudnn.benchmark = True
 
-    # Model
     if variant == 'ga':
         model = GA_Blockwise(n_layer=n_layer, d_model=d_model, n_head=n_head, d_ff=d_ff,
                              num_diffusion_steps=diffusion_steps, mv_dim=mv_dim).to(device)
@@ -179,6 +177,17 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
     print(f"  Total tokens={steps * batch_size * grad_accum * seq_len / 1e9:.1f}B")
     print(f"  Logging to {LOG}")
 
+    resume_path = resume or OUT
+    prev_step = 0
+    if os.path.exists(resume_path):
+        raw = torch.load(resume_path, map_location='cpu', weights_only=False)
+        state = raw.get('model', raw) if isinstance(raw, dict) else raw
+        model.load_state_dict(state, strict=True)
+        prev_step = int(raw.get('step', 0)) if isinstance(raw, dict) else 0
+        print(f"  Resumed from {resume_path} at step {prev_step}")
+    else:
+        print(f"  No checkpoint at {resume_path}, starting from scratch")
+
     # Data
     from data.byte_shard_dataset import ByteShardDataset
     ds = ByteShardDataset(
@@ -188,12 +197,18 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
 
     # Optimizer
     opt = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=0.1)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, steps)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, max(steps, 1))
+    # Checkpoints do not currently store optimizer/scheduler state. Preserve the
+    # intended global cosine LR phase when resuming model weights mid-run.
+    if prev_step > 0:
+        for group in opt.param_groups:
+            group['lr'] = lr * 0.5 * (1.0 + math.cos(math.pi * min(prev_step, steps) / max(steps, 1)))
+        scheduler.last_epoch = prev_step
 
     # AMP scaler
     scaler = torch.amp.GradScaler('cuda')
 
-    step = 0
+    step = prev_step
     data_iter = iter(dl)
     opt.zero_grad()
     t_start = time.time()
@@ -274,13 +289,13 @@ def train(variant='ga', n_layer=2, d_model=128, n_head=4, d_ff=256,
                 'step': step, 'model': model.state_dict(),
                 'variant': variant, 'args': {'n_layer': n_layer, 'd_model': d_model,
                                             'n_head': n_head, 'd_ff': d_ff},
-                'mv_dim': mv_dim,  # Patched 2026-06-05: so eval_one_ckpt can recover GA dim
+                'mv_dim': mv_dim,
                 'loss_clean': float(loss_clean.detach().cpu()),
                 'block_ce': float(avg_block.detach().cpu()),
                 'tokens_seen': step * batch_size * grad_accum * seq_len,
             }, OUT)
             print(f"  saved {OUT}", flush=True)
-            if args.eval_on_save:
+            if eval_on_save:
                 import subprocess
                 import sys as _sys
                 subprocess.run([_sys.executable, '/home/peb/code/bbt/eval_one_ckpt.py', OUT], check=False)
@@ -309,6 +324,8 @@ if __name__ == '__main__':
     ap.add_argument('--seed', type=int, default=1234, help='RNG seed for data ordering')
     ap.add_argument('--eval-on-save', action='store_true',
                     help='Run eval_one_ckpt.py after every checkpoint save (adds ~30s per save)')
+    ap.add_argument('--resume', type=str, default=None,
+                    help='Checkpoint path to resume from (defaults to output checkpoint if present)')
     args = ap.parse_args()
     train(
         variant=args.variant,
@@ -319,4 +336,5 @@ if __name__ == '__main__':
         lr=args.lr, block_size=args.block_size,
         num_blocks=args.num_blocks, block_weight=args.block_weight,
         mv_dim=args.mv_dim, seed=args.seed,
+        resume=args.resume, eval_on_save=args.eval_on_save,
     )

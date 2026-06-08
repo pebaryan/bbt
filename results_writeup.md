@@ -5,8 +5,8 @@
 All models use the same transformer backbone: RoPE-based attention with GLU activations, RMSNorm pre-normalization, and cosine LR schedule with AdamW. Training is on a mixed corpus of TinyStories, FineWeb, and WikiText-103 (byte-level shards, 257 vocab including mask token) at sequence length 512.
 
 Two model scales are compared:
-- **2L/128d** (0.37M params) — trained to 1 billion tokens (15K steps, 9 sp/s on V100)
-- **16L/768d** (114M params) — trained to 82 million tokens (5K steps, 0.22 sp/s on V100)
+- **2L/128d** (0.37M params) — trained to ~1 billion tokens (15K steps, 983M tokens)
+- **16L/768d** (114M params) — first trained as a controlled 82M-token sweep (5K steps), then extended for the best GA dim=16 setting to **1.0B tokens** (61,036 steps, 1,000,013,824 tokens)
 
 Both use a **blockwise dual-loss** training objective (BLT-D style): a causal next-byte CE loss paired with a block-diffusion CE loss that corrupts 2 random 8-byte blocks per sample and reconstructs them with bidirectional attention within the block.
 
@@ -23,17 +23,17 @@ The central finding is that **Geometric Algebra embeddings match or exceed stand
 | **AR CE baseline** (causal only) | Euclidean 128D | 33K (tied) | 1.322 | 2.78 | 1.023 |
 | **GA dim=16 (blockwise, 2 seeds)** | **Cl(3,0) → 16D** | **4K + 4K** | **1.294 ± 0.029** | **2.71 ± 0.01** | **0.997** |
 
-**GA dim=16 achieves 11% lower perplexity than vanilla blockwise** (2.70 vs 3.06) and **3% lower than a pure causal CE baseline** (2.70 vs 2.78), despite using **4× fewer embedding parameters** (8K vs 33K). Vanilla with full-sequence masked diffusion (MDLM-style) reaches PPL 2.93 — between blockwise and AR — confirming that the diffusion objective format matters less than the architecture: all vanilla multi-task variants underperform pure AR (2.78), while GA makes the multi-task setting outperform it. The GA advantage is robust across random seeds: two independent runs with different seeds (1234, 5678) produce nearly identical test PPL (2.70 vs 2.72 — <1% variance). At 16L scale, vanilla holds a narrower 5% PPL edge (2.27 vs 2.38). The structured Cl(3,0) space encodes byte relationships more compactly than an unstructured Euclidean embedding — particularly when model capacity is constrained.
+**GA dim=16 achieves 11% lower perplexity than vanilla blockwise** (2.70 vs 3.06) and **3% lower than a pure causal CE baseline** (2.70 vs 2.78), despite using **4× fewer embedding parameters** (8K vs 33K). Vanilla with full-sequence masked diffusion (MDLM-style) reaches PPL 2.93 — between blockwise and AR — confirming that the diffusion objective format matters less than the architecture: all vanilla multi-task variants underperform pure AR (2.78), while GA makes the multi-task setting outperform it. The GA advantage is robust across random seeds: two independent runs with different seeds (1234, 5678) produce nearly identical test PPL (2.70 vs 2.72 — <1% variance). At 16L scale, GA dim=16 is also the best 82M-token controlled variant (PPL 2.17 vs vanilla 2.27), and extending the same setting to 1B tokens lowers test PPL further to **1.735**. The structured Cl(3,0) space encodes byte relationships more compactly than an unstructured Euclidean embedding — particularly when model capacity is constrained.
 
 ### Dimension Scaling
 
 GA performance at 2L scale scales monotonically with multivector dimension up to dim=16 (Figure 1). GA dim=4 underperforms vanilla (4.30 vs 3.05 PPL) — the 4-dim bottleneck is too tight to distinguish 257 byte types. GA dim=8 matches vanilla. GA dim=16 outperforms vanilla by a clear margin.
 
-At 16L scale, a full dimension sweep reveals a **U-shaped optimum**: dim=8 (PPL 2.38) → dim=16 (2.17) → dim=24 (2.22) → dim=32 (2.21). Dim=16 is the empirical sweet spot; dim ≥ 24 degrades slightly but all GA variants beat vanilla (2.27). The degradation plateaus rather than worsening, confirming the GA advantage is robust to dimension choice above a threshold.
+At 16L scale, a full 82M-token dimension sweep reveals a **U-shaped optimum**: dim=8 (PPL 2.38) → dim=16 (2.17) → dim=24 (2.22) → dim=32 (2.21). Dim=16 is the empirical sweet spot; dim ≥ 24 degrades slightly but all GA variants beat vanilla (2.27). Extending dim=16 from 82M to 1B tokens improves PPL from 2.17 to **1.735** (20.0% relative), confirming that the 16L model was data-limited rather than saturated.
 
 ![Figure 1: Loss curves across all experiments. Top row: 2L/128d clean CE (left) and block CE (right) — GA dim=16 (green) converges fastest. Bottom row: 16L/768d clean CE (left) and block CE (right) — GA dominates block reconstruction.](figures/loss_comparison.png)
 
-This suggests the optimal GA dimension lies at dim=16 for byte-level tasks at both model scales. A full 16L dimension sweep (dim=8, 16, 24, 32) reveals a **U-shaped optimum** with dim=16 as the sweet spot (PPL 2.17) — dim=24 and dim=32 plateau slightly higher (2.22, 2.21) but all outperform vanilla (2.27).
+This suggests the optimal GA dimension lies at dim=16 for byte-level tasks at both model scales. A full 16L dimension sweep (dim=8, 16, 24, 32) reveals a **U-shaped optimum** with dim=16 as the sweet spot at matched 82M-token budget (PPL 2.17) — dim=24 and dim=32 plateau slightly higher (2.22, 2.21) but all outperform vanilla (2.27). The 1B-token extension is not part of the controlled dimension sweep, but it shows the sweet-spot configuration continues to benefit strongly from more data.
 
 ### Convergence Speed
 
@@ -55,12 +55,13 @@ The initial advantage is large (0.16 nats) and narrows to a persistent 0.03–0.
 At 114M parameters with AMP enabled for both variants, the comparison is clean:
 
 | Metric | GA dim=8 | GA dim=16 | GA dim=24 | GA dim=32 | Vanilla 16L |
-||--------|----------|-----------|-----------|-----------|-------------|
-|| Final Clean CE | 1.260 | **1.172** | 1.201 | 1.188 | 1.221 |
-|| Best Clean CE | 0.919 | **0.829** | 0.864 | 0.873 | 0.940 |
-|| Final Block CE | 0.892 | 1.353 | 1.363 | 0.962 | 2.033 |
-|| Best Block CE | 0.892 | 0.954 | **0.955** | 1.409 | 0.971 |
-|| **Test PPL** | 2.38 | **2.17** 🥇 | 2.22 🥈 | 2.21 🥈 | 2.27 🥉 |
+|--------|----------|-----------|-----------|-----------|-------------|
+| Train tokens | 82M | 82M | 82M | 82M | 82M |
+| Final Clean CE | 1.260 | **1.172** | 1.201 | 1.188 | 1.221 |
+| Best Clean CE | 0.919 | **0.829** | 0.864 | 0.873 | 0.940 |
+| Final Block CE | 0.892 | 1.353 | 1.363 | 0.962 | 2.033 |
+| Best Block CE | 0.892 | 0.954 | **0.955** | 1.409 | 0.971 |
+| **Test PPL** | 2.38 | **2.17** 🥇 | 2.22 🥈 | 2.21 🥈 | 2.27 🥉 |
 
 **GA dim=16 restores the advantage.** At 2L scale, GA dim=16 beat vanilla by 11%. At 16L scale with dim=8, the advantage vanished (PPL 2.38 vs 2.27). Increasing to dim=16 recovers and even surpasses the advantage: **PPL 2.17 vs 2.27** (−4.4%). The GA dimension must scale with model capacity — dim=8 was a bottleneck at 16L just as dim=4 was at 2L.
 
@@ -69,6 +70,22 @@ Extending beyond dim=16 reveals a **U-shaped optimum**: dim=24 (PPL 2.22) and di
 The improvement spans all metrics: best clean CE improves from 0.940 (vanilla) to 0.829 (GA dim=16), a 12% reduction. The block CE comparison is less clean since GA dim=16 converged to a slightly higher final Block CE than dim=8 (1.35 vs 0.89), but both massively outperform vanilla (2.03).
 
 When compared to the earlier GA 16L run without AMP (final clean CE 1.324), AMP provides a 5% improvement (1.260 vs 1.324), consistent with the benefits of mixed-precision training for this model scale.
+
+## 16L GA dim=16 at 1B Tokens — Data Scaling Result
+
+The strongest follow-up experiment extended the best 16L setting, GA dim=16, from the controlled 82M-token sweep to **1.0B tokens**. The run resumed the 82M-token checkpoint and continued to step 61,036, for 1,000,013,824 total tokens.
+
+| Metric | GA dim=16 @82M | GA dim=16 @1B | Relative change |
+|--------|----------------|---------------|-----------------|
+| Tokens | 81.9M | 1.000B | 12.2× more data |
+| Final Clean CE | 1.172 | **0.807** | −31.1% |
+| Final Block CE | 1.353 | **0.647** | −52.2% |
+| Test PPL | 2.17 | **1.735** | −20.0% |
+| Test CE/BPB | 0.775 | **0.551** | −28.9% |
+
+This is the cleanest evidence that the 16L models were data-limited. Moving from 0.72 tokens/parameter to 8.73 tokens/parameter produces a large PPL gain without changing architecture. Compared to the 82M-token vanilla baseline, the 1B-token GA model is **23.6% lower PPL** (1.735 vs 2.27), but this comparison is not controlled for train tokens; the fair architectural comparison remains the 82M-token sweep above.
+
+The 1B-token run also changes the qualitative picture. At 82M tokens, samples were recognizable but often locally garbled. At 1B tokens, the model produces complete TinyStories-style templates with stable word boundaries and multi-sentence structure, though abstract/news prompts still expose semantic drift and occasional byte artifacts.
 
 ## GA Decoder Space Analysis
 
@@ -113,7 +130,7 @@ The model has learned word boundaries, plausible subword patterns, and short syn
 
 ### 16L Scale (82M tokens)
 
-At larger scale, vanilla and GA dim=16 produce similar-quality text — both are data-limited:
+At the controlled 82M-token budget, vanilla and GA dim=16 produce similar-quality text — both are data-limited:
 
 **Vanilla 16L (seed=99):**
 > "Once upon a time, there was a game back and Timmy felt bad. Timmy learned that was too everywhere he could read the trade. One day, Timmy's mommy came over to come notice anymore. Timmy was so happy and grow away."
@@ -125,6 +142,22 @@ At larger scale, vanilla and GA dim=16 produce similar-quality text — both are
 > "Once upon a time, there was a good veterinarian fans, and everying aness."
 
 At 82M tokens, vanilla and GA dim=16 are qualitatively similar — both produce recognizable TinyStories fragments with occasional coherent spans. GA dim=8 (the bottlenecked variant) is notably worse, with more token-level noise. This confirms that the dimension scaling fix (dim=8 → dim=16) improves not only PPL but also generation quality at 16L scale, even if the small data budget prevents either model from reaching full coherence.
+
+### 16L GA dim=16 (1B tokens)
+
+The 1B-token GA dim=16 checkpoint is a qualitative jump over the 82M-token samples. With the same AR-style sampler (`temp=0.85`, `top_k=40`), it produces stable TinyStories templates:
+
+> "Once upon a time, there was a little girl named Mia. She had a glass of candy and lots of people. One day, she found a shiny toy and she wanted to play with it. She thought it was too attractive. But she had a bow and obediently filled ..."
+
+On the same prompt and seed, the 82M-token baselines are less stable:
+
+**Vanilla 16L @82M:**
+> "Once upon a time, there was a good bird dog named Anna. Lucy learned that her mom said help her mom her goal and the radio. It had done learned by a walking to keep the bird and the wolf count..."
+
+**GA 16L dim=8 @82M:**
+> "Once upon a time, there was a good bird named Danty. So, Whip Tim liked to play with his friends. One day, Sam and a raan at the park to play with it all day..."
+
+The 1B-token model is still not a strong general language model. Abstract prompts such as "The meaning of life is" and news-style prompts still drift into semantically incoherent phrases, and one sample emitted a null byte before restarting a TinyStories fragment. But compared to the 82M-token runs, the improvement in local grammar, word boundaries, and multi-sentence story structure is obvious. This supports the quantitative result: 16L was primarily data-limited.
 
 ## Iterative Blockwise Refinement
 
@@ -146,7 +179,7 @@ This is a known limitation of small diffusion models: the conditional distributi
 
 ## Key Findings
 
-1. **GA embeddings match or exceed standard embeddings** at equal or fewer parameters across all metrics. At 2L scale, GA dim=16 achieves 11% lower PPL than vanilla and 3% lower than a pure AR baseline. At 16L scale, GA dim=16 achieves **4.4% lower PPL** than vanilla (2.17 vs 2.27), confirming the advantage scales with model capacity when the GA dimension is adequate.
+1. **GA embeddings match or exceed standard embeddings** at equal or fewer parameters across all controlled comparisons. At 2L scale, GA dim=16 achieves 11% lower PPL than vanilla and 3% lower than a pure AR baseline. At 16L scale with matched 82M-token budgets, GA dim=16 achieves **4.4% lower PPL** than vanilla (2.17 vs 2.27), confirming the advantage scales with model capacity when the GA dimension is adequate.
 
 2. **GA dimension has a U-shaped optimum.** dim=4 underperforms, dim=8 matches vanilla, dim=16 wins (PPL 2.17). The full 16L sweep (dim=8→16→24→32) confirms dim=16 as the sweet spot, with higher dimensions plateauing slightly above but all beating vanilla (2.27).
 
@@ -154,17 +187,19 @@ This is a known limitation of small diffusion models: the conditional distributi
 
 4. **The blockwise dual-loss objective** (causal CE + block diffusion) produces richer training signals than GP-based structured losses. The block CE is particularly informative: GA's 0.89 vs vanilla's 2.03 suggests the structured embedding space helps reconstruction.
 
-5. **All models are data-limited, not architecture-limited.** At 0.7:1 token-to-param ratio (16L) or 2700:1 (2L), no architecture change can compensate for insufficient data. The GA advantage is real but marginal relative to the 10–100× data deficit.
+5. **The 16L models are strongly data-limited.** At the original 82M-token budget, 16L has only 0.72 tokens/parameter. Extending GA dim=16 to 1B tokens raises this to 8.73 tokens/parameter and improves PPL from 2.17 to **1.735**. The GA advantage is real, but data scale dominates the loss curve at 114M parameters.
 
 6. **The blockwise dual-loss objective helps or hurts depending on the embedding.** GA dim=16 (PPL 2.70) beats a pure AR causal CE baseline (PPL 2.78) at equal architecture — the GA structured space makes the two tasks complementary. Vanilla blockwise (PPL 3.06) underperforms the same AR baseline — the diffusion task interferes without the GA inductive bias. This is the cleanest evidence that GA embeddings extract more value from multi-task training than standard embeddings.
 
 ## Conclusion and Outlook
 
-This work investigated Geometric Algebra embeddings as a drop-in replacement for standard token embeddings in byte-level diffusion language models. Across two model scales (2L/128d at 1B tokens, 16L/768d at 82M tokens), GA embeddings match or exceed standard embeddings on held-out perplexity while using 4× fewer embedding parameters.
+This work investigated Geometric Algebra embeddings as a drop-in replacement for standard token embeddings in byte-level diffusion language models. Across two model scales (2L/128d at ~1B tokens, 16L/768d at 82M tokens, plus a 16L GA dim=16 extension to 1B tokens), GA embeddings match or exceed standard embeddings on held-out perplexity while using far fewer embedding parameters.
 
 **The strongest result is at small scale.** GA dim=16 at 2L achieves 2.70 PPL vs vanilla's 3.06 — an 11% improvement — and notably beats a pure causal CE transformer with the same architecture (2.70 vs 2.78). This means the blockwise diffusion objective, which *hurts* vanilla performance (3.06 vs 2.78), actually *helps* GA performance when the structured embedding space provides a complementary learning signal. The result is robust across seeds (2.71 ± 0.01 PPL). The structured Cl(3,0) space regularizes the embedding layer effectively when model capacity is constrained.
 
-**At larger scale, the GA advantage scales with dimension.** At 16L/768d with dim=8, GA and vanilla were tied. Increasing to GA dim=16 **restores a 4.4% PPL advantage** (2.17 vs 2.27) and achieves the best overall clean CE of any 16L model (0.829 vs vanilla's 0.940). A full dimension sweep confirms the optimum is **U-shaped**: dim=16 (2.17) → dim=24 (2.22) → dim=32 (2.21), with all GA variants beating vanilla. The dim=8 bottleneck at 16L mirrors the dim=4 bottleneck at 2L — and in both cases, doubling to dim=16 unlocks the advantage. However, vanilla still produces qualitatively better autoregressive samples at this scale, suggesting that loss improvements don't directly translate to generation quality.
+**At larger scale, the GA advantage scales with dimension.** At 16L/768d with dim=8, GA and vanilla were tied. Increasing to GA dim=16 **restores a 4.4% PPL advantage** (2.17 vs 2.27) and achieves the best overall clean CE of any 82M-token 16L model (0.829 vs vanilla's 0.940). A full dimension sweep confirms the optimum is **U-shaped**: dim=16 (2.17) → dim=24 (2.22) → dim=32 (2.21), with all GA variants beating vanilla. The dim=8 bottleneck at 16L mirrors the dim=4 bottleneck at 2L — and in both cases, doubling to dim=16 unlocks the advantage.
+
+**At 1B tokens, GA dim=16 improves substantially.** Continuing the 16L GA dim=16 model to 1B tokens lowers test PPL to **1.735** and BPB to **0.551**, a 20% PPL reduction from the 82M-token checkpoint. Sample quality improves from garbled TinyStories fragments to mostly stable short-story templates. Abstract prompts remain weak, so the model is still data/objective limited, but the earlier conclusion that 16L was undertrained is now confirmed directly.
 
 **For the galbook thesis**, these results support two claims:
 1. **GA embeddings are a viable architectural primitive** — they match or beat standard embeddings at no cost to training stability or throughput
@@ -172,6 +207,6 @@ This work investigated Geometric Algebra embeddings as a drop-in replacement for
 
 The blockwise training objective similarly proved more useful as a regularized training signal than as an inference-time sampling strategy. The iterative refinement experiments were negative: the model's conditional distributions are too sharp to benefit from block-level reconstruction at inference.
 
-**Limitations.** Experiments are single-seed per variant (except GA dim=16 with 2 seeds at 2L scale). No external baselines (MDLM, BLT) were compared on the same data. Sample quality at 16L still favors vanilla despite GA's PPL advantage — the gap between loss and generation quality is not fully understood.
+**Limitations.** Experiments are single-seed per variant (except GA dim=16 with 2 seeds at 2L scale). No external baselines (MDLM, BLT) were compared on the same data. The 1B-token result exists only for GA dim=16, so it proves data scaling for the best GA configuration but does not yet isolate architecture from token budget at 1B scale. A 1B-token vanilla 16L run is needed for the strict large-scale controlled comparison.
 
-**Future work.** The key remaining question is whether the GA-vanilla gap widens with sufficient data — scaling to 1B+ tokens on the 16L models would determine this. Understanding the gap between PPL and generation quality also merits investigation.
+**Future work.** The key remaining experiment is a matched 1B-token vanilla 16L run. That would determine whether the GA-vs-vanilla gap widens, narrows, or stays constant once both architectures receive adequate data. Understanding the gap between PPL and generation quality also merits investigation, especially under longer samples and non-TinyStories prompts.
